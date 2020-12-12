@@ -1,10 +1,12 @@
 from seq2seq import Seq2Seq, Encoder, Decoder
 from prepare_data import load_data
 import torch
+import torch.nn.functional as F
 import torch.nn as nn
 import torch.optim as optim
 import time
 import math
+import numpy as np
 from tqdm import tqdm
 from allennlp.training.metrics import BLEU
 
@@ -13,9 +15,38 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def init_weights(m):
-    for name, param in m.named_parameters():
-        nn.init.uniform_(param.data, -0.08, 0.08)
+# def init_weights(m):
+#     for name, param in m.named_parameters():
+#         nn.init.uniform_(param.data, -0.08, 0.08)
+
+
+def init_weights(module):
+    if isinstance(module, (nn.Linear, nn.Conv2d)):
+        # nn.init.xavier_uniform_(module.weight.data)
+        nn.init.orthogonal(module.weight)
+        nn.init.constant_(module.bias.data, 0.0)
+
+    elif isinstance(module, nn.LSTM):
+        nn.init.xavier_uniform_(module.weight_ih_l0.data)
+        nn.init.orthogonal_(module.weight_hh_l0.data)
+        nn.init.constant_(module.bias_ih_l0.data, 0.0)
+        nn.init.constant_(module.bias_hh_l0.data, 0.0)
+        hidden_size = module.bias_hh_l0.data.shape[0] // 4
+        module.bias_hh_l0.data[hidden_size:(2*hidden_size)] = 1.0
+
+        if module.bidirectional:
+            nn.init.xavier_uniform_(module.weight_ih_l0_reverse.data)
+            nn.init.orthogonal_(module.weight_hh_l0_reverse.data)
+            nn.init.constant_(module.bias_ih_l0_reverse.data, 0.0)
+            nn.init.constant_(module.bias_hh_l0_reverse.data, 0.0)
+            module.bias_hh_l0_reverse.data[hidden_size:(2*hidden_size)] = 1.0
+
+    elif isinstance(module, nn.Embedding):
+        nn.init.xavier_normal_(module.weight.data)
+
+    else:
+        for param in module.parameters():
+            nn.init.normal_(param)
 
 
 def epoch_time(start_time, end_time):
@@ -26,8 +57,8 @@ def epoch_time(start_time, end_time):
 
 
 def main():
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    dataset = load_data(batch_size=32)
+    device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+    dataset = load_data(batch_size=32, device=device)
     SRC = dataset['fields'][0]
     INPUT_DIM = len(SRC.vocab)
     OUTPUT_DIM = len(SRC.vocab)
@@ -40,12 +71,12 @@ def main():
 
     enc = Encoder(INPUT_DIM, ENC_EMB_DIM, HID_DIM, N_LAYERS, ENC_DROPOUT)
     dec = Decoder(OUTPUT_DIM, DEC_EMB_DIM, HID_DIM, N_LAYERS, DEC_DROPOUT)
+    PAD_IDX = SRC.vocab.stoi[SRC.pad_token]
 
-    model = Seq2Seq(enc, dec, device).to(device)
+    model = Seq2Seq(enc, dec, PAD_IDX, device).to(device)
     model.apply(init_weights)
     print(f'The model has {count_parameters(model):,} trainable parameters')
-    optimizer = optim.Adam(model.parameters())
-    PAD_IDX = SRC.vocab.stoi[SRC.pad_token]
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
 
@@ -88,12 +119,12 @@ def train(model, iterator, optimizer, criterion, clip):
     epoch_loss = 0
     # i = 0
     for batch in tqdm(iterator):
-        src = batch.src
-        trg = batch.trg
+        src, src_len = batch.src
+        trg, trg_len = batch.trg
 
         optimizer.zero_grad()
 
-        output = model(src, trg)
+        output = model(src, src_len, trg, teacher_forcing_ratio=1)
 
         # trg = [trg len, batch size]
         # output = [trg len, batch size, output dim]
@@ -126,12 +157,12 @@ def evaluate(model, iterator, criterion, bleu=None):
 
     with torch.no_grad():
         for batch in tqdm(iterator):
-            src = batch.src
+            src, src_len = batch.src
             # trg = [trg len, batch size]
-            trg = batch.trg
+            trg, trg_len = batch.trg
 
             # output = [trg len, batch size, output dim]
-            output = model(src, trg, 0)  # turn off teacher forcing
+            output = model(src, src_len, trg, 0)  # turn off teacher forcing
             output_dim = output.shape[-1]
 
             if bleu:
