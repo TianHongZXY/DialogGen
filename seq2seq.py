@@ -3,6 +3,7 @@ import torch
 import random
 import torch.nn.functional as F
 from itertools import chain
+from torchsnooper import snoop as torchsnoop
 
 
 class Attention(nn.Module):
@@ -36,17 +37,31 @@ class Attention(nn.Module):
         return F.softmax(attention, dim=1)
 
 
+class Classifier2layer(nn.Module):
+    def __init__(self, input_dim, num_class):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = num_class
+        self.classifer = nn.Linear(in_features=input_dim, out_features=num_class)
+
+    def forward(self, x):
+        outputs = self.classifer(x)
+        return F.softmax(outputs, dim=1)
+
+
 class ConvEncoder(nn.Module):
-    def __init__(self, emb_dim, hid_dim, output_dim, kernel_size, stride):
+    def __init__(self, emb_dim, hid_dim, output_dim, kernel_size, stride, dropout=0, sent_len3=5):
         super().__init__()
         self.emb_dim = emb_dim
         self.hid_dim = hid_dim
         self.output_dim = output_dim
         self.kernel_size = kernel_size
         self.conv1 = nn.Conv2d(in_channels=1, out_channels=hid_dim, kernel_size=(kernel_size, self.emb_dim), stride=stride)
-        self.conv2 = nn.Conv2d(in_channels=1, out_channels=hid_dim, kernel_size=(kernel_size, self.emb_dim), stride=stride)
-        self.conv3 = nn.Conv2d(in_channels=1, out_channels=hid_dim, kernel_size=(kernel_size, self.emb_dim), stride=stride)
-        self.fc = nn.Linear(in_features=3 * hid_dim, out_features=output_dim)
+        nn.init.uniform_(self.conv1.weight, -0.001, 0.001)
+        self.conv2 = nn.Conv2d(in_channels=hid_dim, out_channels=2 * hid_dim, kernel_size=(kernel_size, 1), stride=stride)
+        self.conv3 = nn.Conv2d(in_channels=2 * hid_dim, out_channels=output_dim, kernel_size=(sent_len3, 1), stride=stride)
+        self.dropout = nn.Dropout(p=dropout)
+        self.fc = nn.Linear(in_features=2 * hid_dim, out_features=output_dim)
 
     def get_output_dim(self):
         return self.output_dim
@@ -55,33 +70,37 @@ class ConvEncoder(nn.Module):
         """
         Inputs must be embeddings: batch_size x seq_len x emb_dim
         """
-        inputs = inputs.unsqueeze(1)
-        # [batch_size, 1, seq_len, emb_dim]
-        # print('inputs', inputs.size())
-        x1 = self.conv1(inputs).squeeze(-1)
-        # print('x1', x1.size())
-        # [batch_size, output_dim, new_seq_len, 1]
-        x2 = self.conv2(inputs).squeeze(-1)
-        x3 = self.conv3(inputs).squeeze(-1)
-        x1 = F.max_pool1d(x1, x1.size(2)).squeeze()
+        inputs = self.dropout(inputs.unsqueeze(1))
+        # inputs = [batch_size, 1, seq_len, emb_dim]
+        x1 = F.relu(self.conv1(inputs))
+        x1 = self.dropout(x1)
+        # x1 = [batch_size, output_dim, new_seq_len, 1]
+        x2 = F.relu(self.conv2(x1))
+        x2 = self.dropout(x2)
+        # x2 = [batch_size, output_dim, new_seq_len', 1]
+        x3 = F.tanh(self.conv3(x2).squeeze())
+        # outputs = F.sigmoid(self.fc(x3))
+        # outputs = [batch_size, output_dim, 1, 1].squeeze()
+        # x1 = F.max_pool1d(x1, x1.size(2)).squeeze()
         # [batch_size, hid_dim]
-        x2 = F.max_pool1d(x2, x2.size(2)).squeeze()
-        x3 = F.max_pool1d(x3, x3.size(2)).squeeze()
+        # x2 = F.max_pool1d(x2, x2.size(2)).squeeze()
+        # x3 = F.max_pool1d(x3, x3.size(2)).squeeze()
         # batch_size x (3 * hid_dim)
-        outputs = F.sigmoid(self.fc(torch.cat([x1, x2, x3], dim=1)))
+        # outputs = F.sigmoid(self.fc(torch.cat([x1, x2, x3], dim=1)))
+        # outputs = self.fc(torch.cat([x1, x2, x3], dim=1))
 
-        return outputs
+        return x3
 
 
 class Discriminator(nn.Module):
-    def __init__(self, vocab_size, emb_dim, padding_idx, feature_dim, n_filters, kernel_size, stride):
+    def __init__(self, vocab_size, emb_dim, padding_idx, feature_dim, n_filters, kernel_size, stride, sent_len3, dropout=0):
         super().__init__()
         self.kernel_size = kernel_size
         self.embedding = nn.Embedding(num_embeddings=vocab_size, embedding_dim=emb_dim, padding_idx=padding_idx)
         self.topic_encoder = ConvEncoder(emb_dim=emb_dim, hid_dim=n_filters, output_dim=feature_dim,
-                                         kernel_size=kernel_size, stride=stride)
+                                         kernel_size=kernel_size, stride=stride, dropout=dropout, sent_len3=sent_len3)
         self.persona_encoder = ConvEncoder(emb_dim=emb_dim, hid_dim=n_filters, output_dim=feature_dim,
-                                           kernel_size=kernel_size, stride=stride)
+                                           kernel_size=kernel_size, stride=stride, dropout=dropout, sent_len3=sent_len3)
 
     def forward(self, src, trg):
         src = self.embedding(src)
@@ -120,12 +139,12 @@ class Generator(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.device = device
+        self.discriminator = discriminator
         self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=padding_idx)
-        self.topic_encoder = discriminator.topic_encoder
-        self.persona_encoder = discriminator.persona_encoder
+        # self.topic_encoder = discriminator.topic_encoder
+        # self.persona_encoder = discriminator.persona_encoder
         self.context_encoder = context_encoder
-        self.feature_dim = self.persona_encoder.get_output_dim() + \
-                           self.topic_encoder.get_output_dim()
+        self.feature_dim = self.discriminator.topic_encoder.get_output_dim()
         self.agg_output_dim = agg_output_dim
         self.n_layers = n_layers
         self.rnn = nn.LSTM(input_size=lstm_input_dim, hidden_size=lstm_hid_dim, num_layers=n_layers)
@@ -140,17 +159,23 @@ class Generator(nn.Module):
                                               self.AGG, self.fc_H0, self.rnn, self.fc_pred]
                                              )
 
+    # @torchsnoop()
     def forward_encoder(self, src, trg):
-        context = self.context_encoder(src)
+        src_embed = self.embedding(src.T)
+        context = self.context_encoder(src_embed)
         # [batch_size, agg_output_dim]
         C = self.AGG(context)
         # [batch_size, feature_dim]
-        trg_t_feature = self.topic_encoder(trg)
-        trg_p_feature = self.persona_encoder(trg)
+        # trg_t_feature = self.topic_encoder(trg)
+        # trg_p_feature = self.persona_encoder(trg)
+        feature_dict = self.discriminator(src.T, trg.T)
+        trg_t_feature = feature_dict['trg_t_feature']
+        trg_p_feature = feature_dict['trg_p_feature']
         H0 = self.fc_H0(torch.cat([C, trg_t_feature, trg_p_feature], dim=1))
         # H0 = [1, batch_size, lstm_hid_dim]
         return H0.unsqueeze(0)
 
+    # @torchsnoop()
     def forward_decoder(self, inputs, hidden, cell, H0):
         # n directions in the decoder will both always be 1, therefore:
         # hidden = [n layers, batch size, lstm hid dim]
@@ -170,6 +195,7 @@ class Generator(nn.Module):
 
         return prediction, hidden, cell
 
+    # @torchsnoop()
     def forward(self, src, trg, teacher_forcing_ratio=1):
         # src = [src len, batch size]
         # trg = [trg len, batch size]
