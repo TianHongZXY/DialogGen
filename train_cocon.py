@@ -1,4 +1,4 @@
-from seq2seq import Generator, ConvEncoder, Discriminator
+from seq2seq import Generator, ConvEncoder, Discriminator, Classifier2layer
 from prepare_data import load_cocon_data as load_data
 import torch
 import torch.nn.functional as F
@@ -11,7 +11,10 @@ from tqdm import tqdm
 from allennlp.training.metrics import BLEU
 from train_seq2seq import init_weights, count_parameters, epoch_time
 import argparse
-from time import sleep
+from pysnooper import snoop
+from torchsnooper import snoop as torchsnoop
+from itertools import chain
+
 
 def print_metrics():
     # TODO 把print metrics统一起来
@@ -26,60 +29,90 @@ def main():
     parser.add_argument('--gpu', default=-1, type=int, help='which GPU to use, -1 means using CPU')
     parser.add_argument('--save', default=False, type=bool, help='whether to save model or not')
     parser.add_argument('--model', default='disc', type=str, help='choose to train which model: {`disc`, `gen`}, (default: `disc`)')
-
+    parser.add_argument('--bs', default=256, type=int, help='batch size')
+    parser.add_argument('--fea_dim', default=100, type=int, help='feature dim')
+    parser.add_argument('--n_filters', default=300, type=int, help='filters num of conv encoder')
+    parser.add_argument('--emb_dim', default=300, type=int, help='embedding dim')
+    parser.add_argument('--kernel_size', default=5, type=int, help='kernel size of conv encoder')
+    parser.add_argument('--stride', default=2, type=int, help='stride of conv encoder')
+    parser.add_argument('--hid_dim', default=500, type=int, help='hidden dim of lstm')
+    parser.add_argument('--dropout', default=0.5, type=float, help='dropout ratio')
+    parser.add_argument('--n_epochs', default=30, type=int, help='num of train epoch')
+    parser.add_argument('--clip', default=None, type=float, help='grad clip')
+    parser.add_argument('--lamda', default=1e-1, type=float, help='weight of loss_decorr')
+    parser.add_argument('--teach', default=1, type=float, help='propability of using teacher')
+    parser.add_argument('--maxlen', default=29, type=int, help='fixed length of text')
     args = parser.parse_args()
     device = torch.device(args.gpu if (torch.cuda.is_available() and args.gpu >= 0) else 'cpu')
-    batch_size = 128
-    feature_dim = 100
-    n_filters = 300
-    embed_dim = 300
-    kernel_size = 5
-    stride = 2
+    batch_size = args.bs
+    feature_dim = args.fea_dim
+    n_filters = args.n_filters
+    embed_dim = args.emb_dim
+    kernel_size = args.kernel_size
+    stride = args.stride
     agg_output_dim = n_filters
-    lstm_hid_dim = 500
+    lstm_hid_dim = args.hid_dim
     lstm_input_dim = embed_dim + lstm_hid_dim
     n_layers = 1
     K = 1
-    dropout = 0.5
-    n_epochs = 10
-    grad_clip = 5
-    lamda = 1e-2
-    dataset = load_data(batch_size=batch_size, device=device)
+    dropout = args.dropout
+    n_epochs = args.n_epochs
+    grad_clip = args.clip
+    lamda = args.lamda
+    teacher_forcing_ratio = args.teach
+    sent_len1 = maxlen = 29  # dailydialog数据集平均每条src+trg有29个单词
+    sent_len2 = math.floor((sent_len1 - kernel_size) / stride) + 1
+    sent_len3 = math.floor((sent_len2 - kernel_size) / stride) + 1
+    dataset = load_data(train_file_path='cocon_train_full.tsv', val_file_path='cocon_valid_full.tsv',
+                        test_file_path='cocon_test_full.tsv', batch_size=batch_size, device=device, maxlen=maxlen)
     texts = dataset['fields'][0]
     vocab_size = len(texts.vocab)
     PAD_IDX = texts.vocab.stoi[texts.pad_token]
     ce_criterion = nn.CrossEntropyLoss()
-    bce_criterion = nn.BCELoss()
+    bce_criterion = nn.BCEWithLogitsLoss()
 
     best_valid_loss = float('inf')
+    best_bleu = 0
     discriminator = Discriminator(vocab_size=vocab_size, emb_dim=embed_dim, padding_idx=PAD_IDX,
                                   feature_dim=feature_dim, n_filters=n_filters, kernel_size=kernel_size,
-                                  stride=stride).to(device)
+                                  stride=stride, dropout=dropout, sent_len3=sent_len3).to(device)
+    disc_embedding = discriminator.embedding
+    t_encoder = discriminator.topic_encoder
+    t_classifier = Classifier2layer(input_dim=2 * feature_dim, num_class=2).to(device)
+    t_optimizer = optim.Adam(chain(disc_embedding.parameters(), t_encoder.parameters(), t_classifier.parameters()), lr=1e-4)
+    p_encoder = discriminator.persona_encoder
+    p_classifier = Classifier2layer(input_dim=2 * feature_dim, num_class=2).to(device)
+    p_optimizer = optim.Adam(chain(disc_embedding.parameters(), p_encoder.parameters(), p_classifier.parameters()), lr=1e-4)
 
     if args.model == 'disc':
-        # TODO 如果加载模型，这步应该省略
+        # TODO 完善加载训练过的模型继续训练
         discriminator.apply(init_weights)
-        print(f'The model has {count_parameters(discriminator):,} trainable parameters')
-        disc_optimizer = optim.Adam(discriminator.parameters(), lr=1e-4)
-
+        print(f'The model has {count_parameters(discriminator) + count_parameters(p_classifier) + count_parameters(t_classifier):,} trainable parameters')
         for epoch in range(n_epochs):
             start_time = time.time()
-            train_metrics = train_discriminator(model=discriminator, epoch=epoch,
-                                                iterator=dataset['train_iterator'], optimizer=disc_optimizer,
+            train_metrics = train_discriminator(model=discriminator, epoch=epoch, t_classifier=t_classifier,
+                                                p_classifier=p_classifier, p_optimizer=p_optimizer,
+                                                iterator=dataset['train_iterator'], t_optimizer=t_optimizer,
                                                 criterion=bce_criterion, clip=grad_clip, lamda=lamda
                                                 )
-            # TODO 完善eval代码
-            valid_metrics = evaluate_discriminator(model=discriminator, epoch=epoch,
+            valid_metrics = evaluate_discriminator(model=discriminator, epoch=epoch, t_classifier=t_classifier,
+                                                   p_classifier=p_classifier,
                                                    iterator=dataset['valid_iterator'], criterion=bce_criterion, lamda=lamda)
-            test_metrics = evaluate_discriminator(model=discriminator, epoch=epoch,
+            test_metrics = evaluate_discriminator(model=discriminator, epoch=epoch, t_classifier=t_classifier,
+                                                  p_classifier=p_classifier,
                                                   iterator=dataset['test_iterator'], criterion=bce_criterion, lamda=lamda)
+            # TODO 完善print_metrics
             train_loss_xent = train_metrics['epoch_loss_xent']
             train_loss_decorr = train_metrics['epoch_loss_DeCorr']
             valid_loss_xent = valid_metrics['epoch_loss_xent']
             valid_loss_decorr = valid_metrics['epoch_loss_DeCorr']
+            valid_topic_acc = valid_metrics['epoch_topic_acc']
+            valid_person_acc = valid_metrics['epoch_person_acc']
             valid_loss = valid_loss_xent + valid_loss_decorr
             test_loss_xent = test_metrics['epoch_loss_xent']
             test_loss_decorr = test_metrics['epoch_loss_DeCorr']
+            test_topic_acc = test_metrics['epoch_topic_acc']
+            test_person_acc = test_metrics['epoch_person_acc']
             end_time = time.time()
             epoch_mins, epoch_secs = epoch_time(start_time, end_time)
             if valid_loss < best_valid_loss:
@@ -88,29 +121,34 @@ def main():
 
             print(f'Epoch: {epoch + 1:02} | Time: {epoch_mins}m {epoch_secs}s')
             print(f'\tTrain Loss xent: {train_loss_xent:.3f} | Train Loss DeCorr: {train_loss_decorr:.3f} | ')
-            print(f'\tVal Loss xent: {valid_loss_xent:.3f} | Val Loss DeCorr: {valid_loss_decorr:.3f} | ')
-            print(f'\tTest Loss xent: {test_loss_xent:.3f} | Test Loss DeCorr: {test_loss_decorr:.3f} | ')
+            print(f'\tVal Loss xent: {valid_loss_xent:.3f} | Val Loss DeCorr: {valid_loss_decorr:.3f} | '
+                  f'Val topic acc: {valid_topic_acc:.3f} | Val person acc: {valid_person_acc:.3f} | ')
+
+            print(f'\tTest Loss xent: {test_loss_xent:.3f} | Test Loss DeCorr: {test_loss_decorr:.3f} | '
+                  f'Test topic acc: {test_topic_acc:.3f} | Test person acc: {test_person_acc:.3f} | ')
     elif args.model == 'gen':
         discriminator.load_state_dict(torch.load('models/best-disc-model.pt'))
         for param in discriminator.parameters():
             param.requires_grad = False
+        # 暂时不共享lstm和disc的embedding
+        # discriminator.embedding.requires_grad = True
         context_encoder = ConvEncoder(emb_dim=embed_dim, hid_dim=n_filters, output_dim=feature_dim,
-                                      kernel_size=kernel_size, stride=stride)
+                                      kernel_size=kernel_size, stride=stride, dropout=dropout, sent_len3=sent_len3)
         model = Generator(vocab_size=vocab_size, emb_dim=embed_dim, discriminator=discriminator,
                           context_encoder=context_encoder, agg_output_dim=agg_output_dim, lstm_hid_dim=lstm_hid_dim,
                           lstm_input_dim=lstm_input_dim, n_layers=n_layers, dropout=dropout, K=K, device=device).to(device)
 
         print(f'The model has {count_parameters(model):,} trainable parameters')
-        # TODO 如果加载模型，这步应该省略
+        # TODO 完善加载模型继续训练
         model.encoder_decoder.apply(init_weights)
         optimizer = optim.Adam(filter(lambda x: x.requires_grad, model.parameters()), lr=1e-4)
         
-        bleu = BLEU(exclude_indices={PAD_IDX, SRC.vocab.stoi[SRC.eos_token], SRC.vocab.stoi[SRC.init_token]})
+        bleu = BLEU(exclude_indices={PAD_IDX, texts.vocab.stoi[texts.eos_token], texts.vocab.stoi[texts.init_token]})
 
         for epoch in range(n_epochs):
             start_time = time.time()
-            train_metrics = train(model, dataset['train_iterator'], optimizer, ce_criterion, grad_clip)
-            valid_metrics = evaluate(model, dataset['valid_iterator'], ce_criterion, bleu=bleu)
+            train_metrics = train_generator(model, dataset['train_iterator'], optimizer, ce_criterion, grad_clip, teacher_forcing_ratio=teacher_forcing_ratio)
+            valid_metrics = evaluate_generator(model, dataset['valid_iterator'], ce_criterion, bleu=bleu)
             train_loss = train_metrics['epoch_loss']
             valid_loss = valid_metrics['epoch_loss']
             valid_bleu = valid_metrics['bleu']
@@ -118,33 +156,39 @@ def main():
 
             epoch_mins, epoch_secs = epoch_time(start_time, end_time)
 
+            # if best_bleu < valid_bleu:
             if valid_loss < best_valid_loss:
                 best_valid_loss = valid_loss
-                torch.save(model.encoder_decoder.state_dict(), 'best-enc-dec-model.pt')
-
+                print('best valid loss: {:.3f}'.format(best_valid_loss))
+                print('best PPL: {:.3f}'.format(math.exp(best_valid_loss)))
+                print('current bleu: ', best_bleu)
+                torch.save(model.encoder_decoder.state_dict(), 'models/best-enc-dec-model.pt')
+                torch.save(model, 'models/full_model.pt')
             print(f'Epoch: {epoch + 1:02} | Time: {epoch_mins}m {epoch_secs}s')
             print(f'\tTrain Loss: {train_loss:.3f} | Train PPL: {math.exp(train_loss):7.3f}')
             print(f'\tVal. Loss: {valid_loss:.3f} |  Val. PPL: {math.exp(valid_loss):7.3f} | Val. BLEU: {valid_bleu:.5f} |')
 
-        model.encoder_decoder.load_state_dict(torch.load('best-gen-model.pt'))
-        test_metrics = evaluate(model, dataset['test_iterator'], ce_criterion, bleu=bleu)
-        test_loss = test_metrics['epoch_loss']
-        test_bleu = test_metrics['bleu']
-        print(f'| Test Loss: {test_loss:.3f} | Test PPL: {math.exp(test_loss):7.3f} | Test BLEU: {test_bleu:.5f} |')
+        # model.encoder_decoder.load_state_dict(torch.load('models/best-enc-dec-model.pt'))
+        # test_metrics = evaluate_generator(model, dataset['test_iterator'], ce_criterion, bleu=bleu)
+        # test_loss = test_metrics['epoch_loss']
+        # test_bleu = test_metrics['bleu']
+        # test_generator(model, dataset['test_iterator'], text_field=texts)
+        #
+        # print(f'\tTest Loss: {test_loss:.3f} | Test PPL: {math.exp(test_loss):7.3f} | Test BLEU: {test_bleu:.5f} |')
 
 
-def train(model, iterator, optimizer, criterion, clip):
+def train_generator(model, iterator, optimizer, criterion, clip, teacher_forcing_ratio=1):
     model.train()
 
-    epoch_loss = 0
+    epoch_loss_mle = 0
     # i = 0
     for batch in tqdm(iterator):
-        src, src_len = batch.src
-        trg, trg_len = batch.trg
+        src = batch.src
+        trg = batch.trg
 
         optimizer.zero_grad()
 
-        output = model(src, src_len, trg, teacher_forcing_ratio=1)
+        output = model(src, trg, teacher_forcing_ratio=teacher_forcing_ratio)
 
         # trg = [trg len, batch size]
         # output = [trg len, batch size, output dim]
@@ -155,34 +199,34 @@ def train(model, iterator, optimizer, criterion, clip):
 
         # trg = [(trg len - 1) * batch size]
         # output = [(trg len - 1) * batch size, output dim]
-        loss = criterion(output, trg)
+        loss_mle = criterion(output, trg)
 
-        loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+        loss_mle.backward()
+        if clip:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
 
         optimizer.step()
 
-        epoch_loss += loss.item()
+        epoch_loss_mle += loss_mle.item()
         # i += 1
         # if i == 10:
         # break
-    return {'epoch_loss': epoch_loss / len(iterator)}
+    return {'epoch_loss': epoch_loss_mle / len(iterator)}
 
 
-def evaluate(model, iterator, criterion, bleu=None):
+def evaluate_generator(model, iterator, criterion, bleu=None):
     model.eval()
 
     epoch_loss = 0
 
     with torch.no_grad():
         for batch in tqdm(iterator):
-            src, src_len = batch.src
+            src = batch.src
             # trg = [trg len, batch size]
-            trg, trg_len = batch.trg
+            trg = batch.trg
 
             # output = [trg len, batch size, output dim]
-            output = model(src, src_len, trg, 0)  # turn off teacher forcing
+            output = model(src, trg, 0)  # turn off teacher forcing
             output_dim = output.shape[-1]
 
             if bleu:
@@ -200,7 +244,6 @@ def evaluate(model, iterator, criterion, bleu=None):
 
     return {'epoch_loss': epoch_loss / len(iterator), 'bleu': bleu.get_metric(reset=True)['BLEU']}
 
-from pysnooper import snoop
 
 # @snoop()
 def corrcoef(x, rowvar=True):
@@ -257,7 +300,6 @@ def corrcoef(x, rowvar=True):
     return c
 
 
-# @snoop()
 def disentangling_loss(feature):
     # feature = [batch_size, hid_dim]
     M = corrcoef(feature, rowvar=False)
@@ -266,8 +308,13 @@ def disentangling_loss(feature):
     return loss_decorr
 
 
-def train_discriminator(model, iterator, optimizer, criterion, clip, epoch, lamda=1e-2):
+# @snoop()
+# @torchsnoop()
+def train_discriminator(model, p_classifier, t_classifier, p_optimizer, t_optimizer,
+                        iterator, criterion, clip, epoch, lamda=1e-2, reg=1e-3):
     model.train()
+    p_classifier.train()
+    t_classifier.train()
     passed_batch = 0
     epoch_loss_xent = 0
     epoch_loss_DeCorr = 0
@@ -283,25 +330,36 @@ def train_discriminator(model, iterator, optimizer, criterion, clip, epoch, lamd
             # same_{} = [batch_size, ]
             same_person = batch.same_person.squeeze(-1).float()
             same_topic = batch.same_topic.squeeze(-1).float()
-            optimizer.zero_grad()
+            p_optimizer.zero_grad()
+            t_optimizer.zero_grad()
             # t_hat = [batch_size, ]
             feature_dict = model(src, trg)
-            src_t_feature = feature_dict['src_t_feature']
-            trg_t_feature = feature_dict['trg_t_feature']
-            t_hat = F.sigmoid(torch.bmm(src_t_feature.unsqueeze(1), trg_t_feature.unsqueeze(1).permute(0, 2, 1))).squeeze()
-            src_p_feature = feature_dict['src_p_feature']
-            trg_p_feature = feature_dict['trg_p_feature']
-            p_hat = F.sigmoid(torch.bmm(src_p_feature.unsqueeze(1), trg_p_feature.unsqueeze(1).permute(0, 2, 1))).squeeze()
+            src_t_feature = F.sigmoid(feature_dict['src_t_feature'])
+            trg_t_feature = F.sigmoid(feature_dict['trg_t_feature'])
+            # t_hat = F.sigmoid(torch.bmm(src_t_feature.unsqueeze(1), trg_t_feature.unsqueeze(1).permute(0, 2, 1))).squeeze()
+            t_hat = torch.mean(src_t_feature * trg_t_feature - 0.5, dim=1)
+            # t_hat = t_classifier(torch.cat([src_t_feature, trg_t_feature], dim=1))
+            src_p_feature = F.sigmoid(feature_dict['src_p_feature'])
+            trg_p_feature = F.sigmoid(feature_dict['trg_p_feature'])
+            # p_hat = F.sigmoid(torch.bmm(src_p_feature.unsqueeze(1), trg_p_feature.unsqueeze(1).permute(0, 2, 1))).squeeze()
+            p_hat = torch.mean(src_p_feature * trg_p_feature - 0.5, dim=1)
+            # p_hat = p_classifier(torch.cat([src_p_feature, trg_p_feature], dim=1))
             loss_t = criterion(t_hat, same_topic)
             loss_p = criterion(p_hat, same_person)
+            # 作者开源代码里加的loss，说是鼓励binary
+            # loss_binary_t = reg * torch.mean(torch.square(torch.ones_like(src_t_feature)-src_t_feature) * torch.square(src_t_feature)) \
+            #               + reg * torch.mean(torch.square(torch.ones_like(trg_t_feature)-trg_t_feature) * torch.square(trg_t_feature))
+            # loss_binary_p = reg * torch.mean(torch.square(torch.ones_like(src_p_feature)-src_p_feature) * torch.square(src_p_feature)) \
+            #               + reg * torch.mean(torch.square(torch.ones_like(trg_p_feature)-trg_p_feature) * torch.square(trg_p_feature))
             loss_xent = loss_t + loss_p
             loss_DeCorr = disentangling_loss(src_t_feature) + disentangling_loss(trg_p_feature) + \
                           disentangling_loss(src_p_feature) + disentangling_loss(trg_t_feature)
             loss_D = loss_xent + lamda * loss_DeCorr
             loss_D.backward()
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
-            optimizer.step()
+            if clip:
+                torch.nn.utils.clip_grad_norm_(chain(model.parameters(), t_classifier.parameters(), p_classifier.parameters()), clip)
+            p_optimizer.step()
+            t_optimizer.step()
 
             epoch_loss_xent += loss_xent.item()
             epoch_loss_DeCorr += loss_DeCorr.item()
@@ -317,11 +375,17 @@ def train_discriminator(model, iterator, optimizer, criterion, clip, epoch, lamd
             'epoch_loss_DeCorr': epoch_loss_DeCorr / (len(iterator) - passed_batch)}
 
 
-def evaluate_discriminator(model, iterator, criterion, epoch, lamda=1e-2):
+def evaluate_discriminator(model, p_classifier, t_classifier, iterator, criterion, epoch, lamda=1e-2):
     model.eval()
+    p_classifier.eval()
+    t_classifier.eval()
     passed_batch = 0
     epoch_loss_xent = 0
     epoch_loss_DeCorr = 0
+    num_batches = len(iterator)
+    batch_size = iterator.batch_size
+    t_correct = 0
+    p_correct = 0
     with torch.no_grad():
         with tqdm(total=len(iterator)) as t:
             for batch in iterator:
@@ -337,18 +401,27 @@ def evaluate_discriminator(model, iterator, criterion, epoch, lamda=1e-2):
                 same_topic = batch.same_topic.squeeze(-1).float()
                 # t_hat = [batch_size, ]
                 feature_dict = model(src, trg)
-                src_t_feature = feature_dict['src_t_feature']
-                trg_t_feature = feature_dict['trg_t_feature']
-                t_hat = F.sigmoid(torch.bmm(src_t_feature.unsqueeze(1), trg_t_feature.unsqueeze(1).permute(0, 2, 1))).squeeze()
-                src_p_feature = feature_dict['src_p_feature']
-                trg_p_feature = feature_dict['trg_p_feature']
-                p_hat = F.sigmoid(torch.bmm(src_p_feature.unsqueeze(1), trg_p_feature.unsqueeze(1).permute(0, 2, 1))).squeeze()
+                src_t_feature = F.sigmoid(feature_dict['src_t_feature'])
+                trg_t_feature = F.sigmoid(feature_dict['trg_t_feature'])
+                t_hat = torch.mean(src_t_feature * trg_t_feature - 0.5, dim=1)
+                # t_hat = t_classifier(torch.cat([src_t_feature, trg_t_feature], dim=1))
+                # t_hat = F.sigmoid(torch.bmm(src_t_feature.unsqueeze(1), trg_t_feature.unsqueeze(1).permute(0, 2, 1))).squeeze()
+                src_p_feature = F.sigmoid(feature_dict['src_p_feature'])
+                trg_p_feature = F.sigmoid(feature_dict['trg_p_feature'])
+                p_hat = torch.mean(src_p_feature * trg_p_feature - 0.5, dim=1)
+                # p_hat = p_classifier(torch.cat([src_p_feature, trg_p_feature], dim=1))
+                # p_hat = F.sigmoid(torch.bmm(src_p_feature.unsqueeze(1), trg_p_feature.unsqueeze(1).permute(0, 2, 1))).squeeze()
                 loss_t = criterion(t_hat, same_topic)
                 loss_p = criterion(p_hat, same_person)
                 loss_xent = loss_t + loss_p
                 loss_DeCorr = disentangling_loss(src_t_feature) + disentangling_loss(trg_p_feature) + \
                               disentangling_loss(src_p_feature) + disentangling_loss(trg_t_feature)
-
+                # t_pred = t_hat.argmax(1)
+                # p_pred = p_hat.argmax(1)
+                t_pred = (t_hat >= 0.5).int()
+                p_pred = (p_hat >= 0.5).int()
+                t_correct += torch.sum((t_pred == same_topic).int())
+                p_correct += torch.sum((p_pred == same_person).int())
                 epoch_loss_xent += loss_xent.item()
                 epoch_loss_DeCorr += loss_DeCorr.item()
                 t.set_postfix(batch_loss_xent=str(float('%.3f' % loss_xent.item())),
@@ -356,6 +429,11 @@ def evaluate_discriminator(model, iterator, criterion, epoch, lamda=1e-2):
                 t.update(1)
 
     return {'epoch_loss_xent': epoch_loss_xent / (len(iterator) - passed_batch),
-            'epoch_loss_DeCorr': epoch_loss_DeCorr / (len(iterator) - passed_batch)}
+            'epoch_loss_DeCorr': epoch_loss_DeCorr / (len(iterator) - passed_batch),
+            'epoch_topic_acc': t_correct / ((num_batches - passed_batch) * batch_size),
+            'epoch_person_acc': p_correct / ((num_batches - passed_batch) * batch_size),
+            }
+
+
 if __name__ == '__main__':
     main()
