@@ -14,6 +14,7 @@ import argparse
 from pysnooper import snoop
 from torchsnooper import snoop as torchsnoop
 from itertools import chain
+import os
 
 
 def print_metrics():
@@ -42,6 +43,10 @@ def main():
     parser.add_argument('--lamda', default=1e-1, type=float, help='weight of loss_decorr')
     parser.add_argument('--teach', default=1, type=float, help='propability of using teacher')
     parser.add_argument('--maxlen', default=29, type=int, help='fixed length of text')
+    parser.add_argument('--train_file', default=None, type=str, help='train file path')
+    parser.add_argument('--valid_file', default=None, type=str, help='valid file path')
+    parser.add_argument('--test_file', default=None, type=str, help='test file path')
+    parser.add_argument('--save_dir', default='.', type=str, help='save dir')
     args = parser.parse_args()
     device = torch.device(args.gpu if (torch.cuda.is_available() and args.gpu >= 0) else 'cpu')
     batch_size = args.bs
@@ -60,11 +65,19 @@ def main():
     grad_clip = args.clip
     lamda = args.lamda
     teacher_forcing_ratio = args.teach
+    save_dir = os.path.join(args.save_dir, 'run' + str(int(time.time())))
+    if not os.path.exists(save_dir):
+        os.mkdir(save_dir)
+
     sent_len1 = maxlen = 29  # dailydialog数据集平均每条src+trg有29个单词
     sent_len2 = math.floor((sent_len1 - kernel_size) / stride) + 1
     sent_len3 = math.floor((sent_len2 - kernel_size) / stride) + 1
-    dataset = load_data(train_file_path='cocon_train_full.tsv', val_file_path='cocon_valid_full.tsv',
-                        test_file_path='cocon_test_full.tsv', batch_size=batch_size, device=device, maxlen=maxlen)
+    train_file_path = args.train_file
+    val_file_path = args.valid_file
+    test_file_path = args.test_file
+
+    dataset = load_data(train_file_path=train_file_path, val_file_path=val_file_path,
+                        test_file_path=test_file_path, batch_size=batch_size, device=device, maxlen=maxlen)
     texts = dataset['fields'][0]
     vocab_size = len(texts.vocab)
     PAD_IDX = texts.vocab.stoi[texts.pad_token]
@@ -115,9 +128,9 @@ def main():
             test_person_acc = test_metrics['epoch_person_acc']
             end_time = time.time()
             epoch_mins, epoch_secs = epoch_time(start_time, end_time)
-            if valid_loss < best_valid_loss:
+            if args.save and valid_loss < best_valid_loss:
                 best_valid_loss = valid_loss
-                torch.save(discriminator.state_dict(), 'models/best-disc-model.pt')
+                torch.save(discriminator.state_dict(), os.path.join(save_dir, f'best-disc-{epoch}.pt'))
 
             print(f'Epoch: {epoch + 1:02} | Time: {epoch_mins}m {epoch_secs}s')
             print(f'\tTrain Loss xent: {train_loss_xent:.3f} | Train Loss DeCorr: {train_loss_decorr:.3f} | ')
@@ -157,18 +170,21 @@ def main():
             epoch_mins, epoch_secs = epoch_time(start_time, end_time)
 
             # if best_bleu < valid_bleu:
-            if valid_loss < best_valid_loss:
-                best_valid_loss = valid_loss
-                print('best valid loss: {:.3f}'.format(best_valid_loss))
-                print('best PPL: {:.3f}'.format(math.exp(best_valid_loss)))
-                print('current bleu: ', best_bleu)
-                torch.save(model.encoder_decoder.state_dict(), 'models/best-enc-dec-model.pt')
-                torch.save(model, 'models/full_model.pt')
+            # if valid_loss < best_valid_loss:
+            #     best_valid_loss = valid_loss
+            #     print('best valid loss: {:.3f}'.format(best_valid_loss))
+            #     print('best PPL: {:.3f}'.format(math.exp(best_valid_loss)))
+            #     print('current bleu: ', best_bleu)
+            #     torch.save(model.encoder_decoder.state_dict(), 'models/best-enc-dec-model.pt')
+            #     torch.save(model, 'models/full_model.pt')
             print(f'Epoch: {epoch + 1:02} | Time: {epoch_mins}m {epoch_secs}s')
             print(f'\tTrain Loss: {train_loss:.3f} | Train PPL: {math.exp(train_loss):7.3f}')
             print(f'\tVal. Loss: {valid_loss:.3f} |  Val. PPL: {math.exp(valid_loss):7.3f} | Val. BLEU: {valid_bleu:.5f} |')
+            if args.save:
+                torch.save(model.encoder_decoder.state_dict(), os.path.join(save_dir, f'enc-dec-model-{epoch}.pt'))
 
-        # model.encoder_decoder.load_state_dict(torch.load('models/best-enc-dec-model.pt'))
+
+# model.encoder_decoder.load_state_dict(torch.load('models/best-enc-dec-model.pt'))
         # test_metrics = evaluate_generator(model, dataset['test_iterator'], ce_criterion, bleu=bleu)
         # test_loss = test_metrics['epoch_loss']
         # test_bleu = test_metrics['bleu']
