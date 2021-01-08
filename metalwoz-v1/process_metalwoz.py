@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 def discriminator_dataset(file_path):
     turns = []
-    pattern = '[’!"#$%&\'()*+,-./:;<=>?@，。?★、…【】《》？“”‘’！[\\]^_`{|}~]+\n\t'
+    pattern = '[’!"#$%&\'()*+,-./:;<=>?@，。?★、…【】《》？“”‘’！[\\]^_`{|}~]+'
 
     with open(file_path, 'r') as f:
         for line in f:
@@ -69,7 +69,7 @@ def discriminator_dataset(file_path):
 
 def generator_dataset(file_path):
     turns = []
-    pattern = '[’!"#$%&\'()*+,-./:;<=>?@，。?★、…【】《》？“”‘’！[\\]^_`{|}~]+\n\t'
+    pattern = '[’!"#$%&\'()*+,-./:;<=>?@，。?★、…【】《》？“”‘’！[\\]^_`{|}~]+'
     with open(file_path, 'r') as f:
         for line in f:
             line = json.loads(line)
@@ -95,8 +95,6 @@ def generator_dataset(file_path):
 
 if __name__ == '__main__':
     seed(20020206)
-    # for i in range(100):
-    #     print(random.randrange(0, 100))
     discriminator_dataset('all.txt')
     generator_dataset('all.txt')
     from time import sleep
@@ -122,8 +120,8 @@ if __name__ == '__main__':
     #             print(line)
 
 
-    # pattern = '[’!"#$%&\'()*+,-./:;<=>?，。?★、…【】《》？“”‘’！[\\]^_`{|}~]+'
-    # text = 'utt1#$^^}{":<>?~(+@splits@utt2??@splits@utt3@splits@utt4(*)&*)%$^&@splits@'
+    # pattern = '[’!"#$%&\'()*+,-./:;<=>?@，。?★、…【】《》？“”‘’！[\\]^_`{|}~]+'
+    # text = 'utt1#$^^}{":<>?~"""??(+??@splits@utt2??@splits@utt3@splits@utt4(*)&*)%$^&@splits@'
     # text = re.sub(pattern, ' ', text)
     # print(text.split('@splits@'))
 

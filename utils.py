@@ -71,8 +71,8 @@ def count_parameters(model):
 
 def init_weights(module):
     if isinstance(module, nn.Linear):
-        # nn.init.xavier_uniform_(module.weight.data)
-        nn.init.orthogonal(module.weight)
+        nn.init.xavier_uniform_(module.weight.data)
+        # nn.init.orthogonal(module.weight)
         nn.init.constant_(module.bias.data, 0.0)
 
     elif isinstance(module, nn.LSTM):
@@ -93,6 +93,10 @@ def init_weights(module):
     elif isinstance(module, nn.Embedding):
         nn.init.xavier_normal_(module.weight.data)
 
+    elif isinstance(module, (nn.Conv2d, nn.Conv1d)):
+        nn.init.kaiming_normal_(module.weight.data)
+        nn.init.constant_(module.bias.data, 0.0)
+
     else:
         pass
         # for param in module.parameters():
@@ -104,3 +108,18 @@ def epoch_time(start_time, end_time):
     elapsed_mins = int(elapsed_time / 60)
     elapsed_secs = int(elapsed_time - (elapsed_mins * 60))
     return elapsed_mins, elapsed_secs
+
+
+def print_metrics(metrics, mode=''):
+    # TODO 把print metrics统一起来
+    print("#" * 20, mode + ' metrics ', "#" * 20)
+    for k, v in metrics.items():
+        print(f'\t{k}: {v:.5f}')
+    print("#" * 20, ' end ', "#" * 20)
+
+
+def write_metrics(metrics, file, mode=''):
+    for k, v in metrics.items():
+        print("#" * 20, mode + ' metrics ', "#" * 20)
+        file.write(f'\t{k}: {v:.5f}')
+        print("#" * 20, ' end ', "#" * 20)
