@@ -24,8 +24,7 @@ def write_to_file(file, src_idx, gold_idx, pred_idx, vocab, pad_idx, eos_idx):
         file.write('gold: ' + gold_str + '\n')
         file.write('pred: ' + pred_str + '\n')
 
-from pysnooper import snoop
-from torchsnooper import snoop as torchsnooper
+
 def test_generator(model, iterator, criterion, bleu=None, dist=None, file=None, text_field=None):
     model.eval()
     epoch_loss = 0
@@ -56,10 +55,15 @@ def test_generator(model, iterator, criterion, bleu=None, dist=None, file=None, 
             trg = trg[1:].reshape(-1)
 
             loss = criterion(output, trg)
-            epoch_loss += loss.item()
+            # TODO 搞明白到底应该怎么计算loss才能得到PPL
+            epoch_loss += loss.item() / src.size(1)
     metrics = dict()
     if dist is not None:
-        inter_dist1, inter_dist2 = dist(hyps)
+        exclude_tokens = set()
+        exclude_tokens.add(text_field.vocab.stoi[text_field.pad_token])
+        exclude_tokens.add(text_field.vocab.stoi[text_field.eos_token])
+        exclude_tokens.add(text_field.vocab.stoi[text_field.init_token])
+        inter_dist1, inter_dist2 = dist(hyps, exclude_tokens=exclude_tokens)
         metrics['dist1'], metrics['dist2'] = inter_dist1, inter_dist2
     if bleu is not None:
         metrics['bleu'] = bleu.get_metric(reset=True)['BLEU']

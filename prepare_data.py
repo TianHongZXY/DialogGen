@@ -8,9 +8,10 @@ from torch.utils.data import DataLoader
 import pandas as pd
 import numpy as np
 from collections import Counter, OrderedDict
-
-
+import logging
+import coloredlogs
 logger = logging.getLogger(__name__)
+coloredlogs.install(level='INFO', logger=logger)
 
 
 class DatasetFromTSV(Dataset):
@@ -36,6 +37,25 @@ def tokenizer(text):
 def load_metalwoz(train_file_path, val_file_path=None, test_file_path=None,
                     batch_size=32, device=torch.device('cpu'), maxlen=29):
     pass
+
+
+def build_field_vocab(vocab_file, field, vectors=None):
+    d = dict()
+    with open(vocab_file, 'r') as f:
+        for line in f.readlines():
+            line = line.split(':')
+            word, freq = line[0], line[1].strip('\n')
+            d[word] = int(freq)
+    freqs = Counter(d)
+    specials = list(OrderedDict.fromkeys(
+        tok for tok in [field.unk_token, field.pad_token, field.init_token,
+                        field.eos_token]))
+    field.vocab = field.vocab_cls(counter=freqs,
+                                  max_size=35000,
+                                  min_freq=2,
+                                  specials=specials,
+                                  vectors=vectors)
+    return field
 
 
 def load_cocon_data(args, train_file_path, val_file_path=None, test_file_path=None,
@@ -76,7 +96,8 @@ def load_cocon_data(args, train_file_path, val_file_path=None, test_file_path=No
             os.mkdir('.vector_cache')
             vectors = Vectors(name=pretrained_embed_file)
 
-    if args.vocab_file is None:
+    if args.vocab_file is None and args.trained_disc is None:
+        logger.info("No pre-defined vocab given, building new vocab now...")
         # train disc的时候保存vocab文件，到了train gen时加载，保证两者的embedding共用一个vocab
         texts.build_vocab(train,
                           max_size=35000,
@@ -86,22 +107,16 @@ def load_cocon_data(args, train_file_path, val_file_path=None, test_file_path=No
         with open(os.path.join(args.save_dir, 'vocab.txt'), 'w') as f:
             for k, v in  texts.vocab.freqs.most_common():
                 f.write( "{}:{}\n".format(k, v))
-    else:
-        d = dict()
-        with open(args.vocab_file, 'r') as f:
-            for line in f.readlines():
-                line = line.split(':')
-                word, freq = line[0], line[1].strip('\n')
-                d[word] = int(freq)
-        freqs = Counter(d)
-        specials = list(OrderedDict.fromkeys(
-            tok for tok in [texts.unk_token, texts.pad_token, texts.init_token,
-                            texts.eos_token]))
-        texts.vocab = texts.vocab_cls(counter=freqs, 
-                                      max_size=35000, 
-                                      min_freq=2, 
-                                      specials=specials,
-                                      vectors=vectors)
+    elif args.vocab_file is not None:
+        #  优先使用给定的vocab file
+        logger.info(f"Using vocab file from {args.vocab_file}")
+        texts = build_field_vocab(vocab_file=args.vocab_file, field=texts, vectors=vectors)
+    elif args.trained_disc is not None:
+        # 当没有给定vocab file时，选用disc的vocab
+        disc_save_dir = os.path.split(args.trained_disc)[0]
+        vocab_file = os.path.join(disc_save_dir, 'vocab.txt')
+        logger.info(f"Using vocab file from {vocab_file}")
+        texts = build_field_vocab(vocab_file=vocab_file, field=texts, vectors=vectors)
 
     train_iterator, valid_iterator, test_iterator = BucketIterator.splits(
         (train, valid, test),

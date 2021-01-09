@@ -20,6 +20,11 @@ import json
 from metrics import distinct
 from utils import disentangling_loss, init_weights, count_parameters, epoch_time, print_metrics, write_metrics
 from test_cocon import test_generator as evaluate_generator
+import logging
+import coloredlogs
+logger = logging.getLogger(__name__)
+coloredlogs.install(level='INFO', logger=logger)
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -50,6 +55,9 @@ def main():
     parser.add_argument('--trained_disc', default=None, type=str, help='load trained disc for training generator')
     parser.add_argument('--num_workers', default=0, type=int, help='how many subprocesses to use for data loading. 0 means that the data will be loaded in the main process.')
     parser.add_argument('--vocab_file', default=None, type=str, help='vocab file path')
+    parser.add_argument('--l2', default=0, type=float, help='l2 regularization')
+    parser.add_argument('--lr', default=1e-4, type=float, help='learning rate')
+
     # args = parser.parse_args()
     args, unparsed = parser.parse_known_args()
     device = torch.device(args.gpu if (torch.cuda.is_available() and args.gpu >= 0) else 'cpu')
@@ -97,7 +105,7 @@ def main():
     args.vocab_size = vocab_size
 
     PAD_IDX = texts.vocab.stoi[texts.pad_token]
-    ce_criterion = nn.CrossEntropyLoss()
+    ce_criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
     bce_criterion = nn.BCEWithLogitsLoss()
 
     best_valid_loss = float('inf')
@@ -117,9 +125,9 @@ def main():
         t_classifier = Classifier2layer(input_dim=2 * feature_dim, num_class=2).to(device)
         p_classifier = Classifier2layer(input_dim=2 * feature_dim, num_class=2).to(device)
         t_optimizer = optim.Adam(chain(disc_embedding.parameters(), t_encoder.parameters(), t_classifier.parameters()),
-                                 lr=1e-4)
+                                 lr=args.lr, weight_decay=args.l2)
         p_optimizer = optim.Adam(chain(disc_embedding.parameters(), p_encoder.parameters(), p_classifier.parameters()),
-                                 lr=1e-4)
+                                 lr=args.lr, weight_decay=args.l2)
         # TODO 完善加载训练过的模型继续训练
         print(f'The model has {count_parameters(discriminator) + count_parameters(p_classifier) + count_parameters(t_classifier):,} trainable parameters')
         for epoch in range(n_epochs):
@@ -150,7 +158,7 @@ def main():
             if args.save:
                 torch.save(discriminator.state_dict(), os.path.join(save_dir, f'best-disc-{epoch}.pt'))
                 with open(os.path.join(save_dir, f'log_epoch{epoch}.txt'), 'w') as log_file:
-                    log_file.write(f'Epoch: {epoch:02}')
+                    log_file.write(f'Epoch: {epoch:02}\n')
                     write_metrics(train_metrics, log_file, mode='Train')
                     write_metrics(valid_metrics, log_file, mode='Valid')
                     write_metrics(test_metrics, log_file, mode='Test')
@@ -184,7 +192,7 @@ def main():
                           context_encoder=context_encoder, agg_output_dim=agg_output_dim, lstm_hid_dim=lstm_hid_dim,
                           lstm_input_dim=lstm_input_dim, n_layers=n_layers, dropout=dropout, K=K, device=device).to(device)
         model.encoder_decoder.apply(init_weights)
-        optimizer = optim.Adam(filter(lambda x: x.requires_grad, model.parameters()), lr=1e-4)
+        optimizer = optim.Adam(filter(lambda x: x.requires_grad, model.parameters()), lr=args.lr, weight_decay=args.l2)
         # TODO 完善加载模型继续训练
         if texts.vocab.vectors is not None:
             model.embedding.weight.data.copy_(texts.vocab.vectors)
@@ -196,13 +204,17 @@ def main():
             start_time = time.time()
             train_metrics = train_generator(model, dataset['train_iterator'], optimizer, ce_criterion, grad_clip, teacher_forcing_ratio=teacher_forcing_ratio)
             #TODO 补上dist，dist计算排除掉pad等special token
-            valid_metrics = evaluate_generator(model, iterator=dataset['valid_iterator'], criterion=ce_criterion, bleu=bleu)
+            valid_metrics = evaluate_generator(model, iterator=dataset['valid_iterator'], criterion=ce_criterion, bleu=bleu, dist=distinct, text_field=texts)
+            # test_metrics = evaluate_generator(model, iterator=dataset['test_iterator'], criterion=ce_criterion, bleu=bleu, dist=distinct, text_field=texts)
             valid_loss = valid_metrics['epoch_loss']
             valid_bleu = valid_metrics['bleu']
             end_time = time.time()
 
             epoch_mins, epoch_secs = epoch_time(start_time, end_time)
-
+            print(f'Epoch: {epoch:02} | Time: {epoch_mins}m {epoch_secs}s')
+            print_metrics(train_metrics, mode='Train')
+            print_metrics(valid_metrics, mode='Valid')
+            # print_metrics(test_metrics, mode='Test')
             if best_bleu < valid_bleu:
                 best_bleu = valid_bleu
             if valid_loss < best_valid_loss:
@@ -210,9 +222,6 @@ def main():
                 best_epoch = epoch
                 print('best valid loss: {:.3f}'.format(best_valid_loss))
                 print('best PPL: {:.3f}'.format(math.exp(best_valid_loss)))
-            print(f'Epoch: {epoch:02} | Time: {epoch_mins}m {epoch_secs}s')
-            print_metrics(train_metrics, mode='Train')
-            print_metrics(valid_metrics, mode='Valid')
             if args.save:
                 torch.save(model.encoder_decoder.state_dict(), os.path.join(save_dir, f'enc-dec-model-{epoch}.pt'))
                 with open(os.path.join(save_dir, f'log_epoch{epoch}.txt'), 'w') as log_file:
@@ -253,8 +262,8 @@ def train_generator(model, iterator, optimizer, criterion, clip, teacher_forcing
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
 
         optimizer.step()
-
-        epoch_loss_mle += loss_mle.item()
+        # TODO 搞明白到底应该怎么计算loss才能得到PPL
+        epoch_loss_mle += loss_mle.item() / src.size(1)
         # i += 1
         # if i == 10:
         # break
@@ -293,7 +302,7 @@ def old_evaluate_generator(model, iterator, criterion, bleu=None, dist=None):
             trg = trg[1:].reshape(-1)
 
             loss = criterion(output, trg)
-            epoch_loss += loss.item()
+            epoch_loss += loss.item() / src.size(1)
     metrics = dict()
     if dist:
         inter_dist1, inter_dist2 = dist(hyps)

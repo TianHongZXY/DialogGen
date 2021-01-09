@@ -72,8 +72,9 @@ def count_parameters(model):
 def init_weights(module):
     if isinstance(module, nn.Linear):
         nn.init.xavier_uniform_(module.weight.data)
-        # nn.init.orthogonal(module.weight)
-        nn.init.constant_(module.bias.data, 0.0)
+        if module.bias is not None:
+            # nn.init.orthogonal(module.weight)
+            nn.init.constant_(module.bias.data, 0.0)
 
     elif isinstance(module, nn.LSTM):
         nn.init.xavier_uniform_(module.weight_ih_l0.data)
@@ -119,7 +120,7 @@ def print_metrics(metrics, mode=''):
 
 
 def write_metrics(metrics, file, mode=''):
+    file.write("#" * 20 + mode + ' metrics ' + "#" * 20 + '\n')
     for k, v in metrics.items():
-        print("#" * 20, mode + ' metrics ', "#" * 20)
-        file.write(f'\t{k}: {v:.5f}')
-        print("#" * 20, ' end ', "#" * 20)
+        file.write(f'\t{k}: {v:.5f}\n')
+    file.write("#" * 20 + ' end ' + "#" * 20 + '\n')
