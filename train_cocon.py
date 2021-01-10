@@ -181,7 +181,7 @@ def main():
         discriminator = Discriminator(vocab_size=len(texts.vocab), emb_dim=trained_disc_args.emb_dim, padding_idx=PAD_IDX,
                                       feature_dim=trained_disc_args.fea_dim, n_filters=trained_disc_args.n_filters, kernel_size=trained_disc_args.kernel_size,
                                       stride=trained_disc_args.stride, dropout=trained_disc_args.dropout, sent_len3=trained_disc_args.sent_len3).to(device)
-        discriminator.load_state_dict(torch.load(args.trained_disc))
+        discriminator.load_state_dict(torch.load(args.trained_disc, map_location={'cuda:0': 'cuda:' + str(args.gpu)}))
         for param in discriminator.parameters():
             param.requires_grad = False
         # 暂时不共享lstm和disc的embedding
@@ -203,7 +203,6 @@ def main():
         for epoch in range(n_epochs):
             start_time = time.time()
             train_metrics = train_generator(model, dataset['train_iterator'], optimizer, ce_criterion, grad_clip, teacher_forcing_ratio=teacher_forcing_ratio)
-            #TODO 补上dist，dist计算排除掉pad等special token
             valid_metrics = evaluate_generator(model, iterator=dataset['valid_iterator'], criterion=ce_criterion, bleu=bleu, dist=distinct, text_field=texts)
             # test_metrics = evaluate_generator(model, iterator=dataset['test_iterator'], criterion=ce_criterion, bleu=bleu, dist=distinct, text_field=texts)
             valid_loss = valid_metrics['epoch_loss']
@@ -262,13 +261,13 @@ def train_generator(model, iterator, optimizer, criterion, clip, teacher_forcing
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
 
         optimizer.step()
-        # TODO 搞明白到底应该怎么计算loss才能得到PPL
-        epoch_loss_mle += loss_mle.item() / src.size(1)
+        # loss是在dim=0上平均后得到的，即除以了batch_size * trg_len，是每个词的cross entropy
+        epoch_loss_mle += loss_mle.item()
         # i += 1
         # if i == 10:
         # break
     metrics = dict()
-    metrics['epoch_loss'] = epoch_loss_mle
+    metrics['epoch_loss'] = epoch_loss_mle / len(iterator)
     metrics['PPL'] = math.exp(metrics['epoch_loss'])
     return metrics
 

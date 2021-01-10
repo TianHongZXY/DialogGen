@@ -55,8 +55,8 @@ def test_generator(model, iterator, criterion, bleu=None, dist=None, file=None, 
             trg = trg[1:].reshape(-1)
 
             loss = criterion(output, trg)
-            # TODO 搞明白到底应该怎么计算loss才能得到PPL
-            epoch_loss += loss.item() / src.size(1)
+            # loss是在dim=0上平均后得到的，即除以了batch_size * trg_len，是每个词的cross entropy
+            epoch_loss += loss.item()
     metrics = dict()
     if dist is not None:
         exclude_tokens = set()
@@ -67,7 +67,7 @@ def test_generator(model, iterator, criterion, bleu=None, dist=None, file=None, 
         metrics['dist1'], metrics['dist2'] = inter_dist1, inter_dist2
     if bleu is not None:
         metrics['bleu'] = bleu.get_metric(reset=True)['BLEU']
-    metrics['epoch_loss'] = epoch_loss
+    metrics['epoch_loss'] = epoch_loss / len(iterator)
     metrics['PPL'] = math.exp(metrics['epoch_loss'])
     return metrics
 
@@ -240,7 +240,7 @@ def main():
                                   kernel_size=trained_disc_args.kernel_size,
                                   stride=trained_disc_args.stride, dropout=trained_disc_args.dropout,
                                   sent_len3=trained_disc_args.sent_len3).to(device)
-    discriminator.load_state_dict(torch.load(args.trained_disc))
+    discriminator.load_state_dict(torch.load(args.trained_disc, map_location={'cuda:0': 'cuda:' + str(args.gpu)}))
     if args.model == 'disc':
         test_metrics = test_discriminator(model=discriminator, iterator=dataset['test_iterator'])
         print_metrics(test_metrics)
@@ -259,7 +259,7 @@ def main():
         model = Generator(vocab_size=len(texts.vocab), emb_dim=trained_gen_args.emb_dim, discriminator=discriminator,
                           context_encoder=context_encoder, agg_output_dim=trained_gen_args.n_filters, lstm_hid_dim=trained_gen_args.hid_dim,
                           lstm_input_dim=trained_gen_args.emb_dim + trained_gen_args.hid_dim, n_layers=n_layers, dropout=trained_gen_args.dropout, K=K, device=device).to(device)
-        model.encoder_decoder.load_state_dict(torch.load(args.trained_gen))
+        model.encoder_decoder.load_state_dict(torch.load(args.trained_gen, map_location={'cuda:0': 'cuda:' + str(args.gpu)}))
         bleu = BLEU(exclude_indices={PAD_IDX, texts.vocab.stoi[texts.eos_token], texts.vocab.stoi[texts.init_token]}) if \
                 args.bleu else None
         dist = distinct if args.dist else None
