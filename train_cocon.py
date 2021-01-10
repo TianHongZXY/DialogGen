@@ -1,4 +1,4 @@
-from seq2seq import Generator, ConvEncoder, Discriminator, Classifier2layer
+from seq2seq import Generator, ConvEncoder, Discriminator, Classifier2layer, GeneratorSeq2seq
 from prepare_data import load_cocon_data as load_data
 import torch
 import torch.nn.functional as F
@@ -57,7 +57,7 @@ def main():
     parser.add_argument('--vocab_file', default=None, type=str, help='vocab file path')
     parser.add_argument('--l2', default=0, type=float, help='l2 regularization')
     parser.add_argument('--lr', default=1e-4, type=float, help='learning rate')
-
+    parser.add_argument('--generator', default='cocon', type=str, help='which generator to use')
     # args = parser.parse_args()
     args, unparsed = parser.parse_known_args()
     device = torch.device(args.gpu if (torch.cuda.is_available() and args.gpu >= 0) else 'cpu')
@@ -188,9 +188,16 @@ def main():
         # discriminator.embedding.requires_grad = True
         context_encoder = ConvEncoder(emb_dim=embed_dim, hid_dim=n_filters, output_dim=feature_dim,
                                       kernel_size=kernel_size, stride=stride, dropout=dropout, sent_len3=sent_len3)
-        model = Generator(vocab_size=vocab_size, emb_dim=embed_dim, discriminator=discriminator,
-                          context_encoder=context_encoder, agg_output_dim=agg_output_dim, lstm_hid_dim=lstm_hid_dim,
-                          lstm_input_dim=lstm_input_dim, n_layers=n_layers, dropout=dropout, K=K, device=device).to(device)
+        if args.generator == 'cocon':
+            model = Generator(vocab_size=vocab_size, emb_dim=embed_dim, discriminator=discriminator,
+                              context_encoder=context_encoder, agg_output_dim=agg_output_dim, lstm_hid_dim=lstm_hid_dim,
+                              lstm_input_dim=lstm_input_dim, n_layers=n_layers, dropout=dropout, K=K, device=device).to(device)
+        elif args.generator =='seq2seq':
+            model = GeneratorSeq2seq(vocab_size=vocab_size, emb_dim=embed_dim, context_encoder=context_encoder,
+                                     lstm_hid_dim=lstm_hid_dim, lstm_input_dim=lstm_input_dim, n_layers=n_layers,
+                                     dropout=dropout, device=device).to(device)
+        else:
+            raise ValueError(f'generator should be in [cocon, seq2seq], but get {args.generator}!')
         model.encoder_decoder.apply(init_weights)
         optimizer = optim.Adam(filter(lambda x: x.requires_grad, model.parameters()), lr=args.lr, weight_decay=args.l2)
         # TODO 完善加载模型继续训练
@@ -219,6 +226,7 @@ def main():
             if valid_loss < best_valid_loss:
                 best_valid_loss = valid_loss
                 best_epoch = epoch
+                print(f'Best epoch: {best_epoch:02}')
                 print('best valid loss: {:.3f}'.format(best_valid_loss))
                 print('best PPL: {:.3f}'.format(math.exp(best_valid_loss)))
             if args.save:

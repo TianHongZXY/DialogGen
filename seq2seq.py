@@ -337,6 +337,87 @@ class Generator(nn.Module):
         return outputs
 
 
+class GeneratorSeq2seq(nn.Module):
+    def __init__(self, vocab_size, emb_dim, context_encoder,
+                 lstm_input_dim, lstm_hid_dim, n_layers=1, dropout=0,
+                 padding_idx=None, device='cpu'
+                 ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.device = device
+        self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=padding_idx)
+        self.context_encoder = context_encoder
+        self.n_layers = n_layers
+        self.rnn = nn.LSTM(input_size=lstm_input_dim, hidden_size=lstm_hid_dim, num_layers=n_layers)
+        self.dropout = nn.Dropout(p=dropout)
+        self.fc_pred = nn.Linear(in_features=lstm_hid_dim, out_features=vocab_size, bias=False)
+        self.encoder_decoder = nn.ModuleList([self.embedding, self.context_encoder,
+                                              self.rnn, self.fc_pred]
+                                             )
+
+    # @torchsnoop()
+    def forward_encoder(self, src, trg):
+        src_embed = self.embedding(src.T)
+        context = self.context_encoder(src_embed)
+        # context = [1, batch_size, lstm_hid_dim]
+        return context.unsqueeze(0)
+
+    def forward_decoder(self, inputs, hidden, cell, H0):
+        # n directions in the decoder will both always be 1, therefore:
+        # hidden = [n layers, batch size, lstm hid dim]
+        # cell = [n layers, batch size, lstm_hid dim]
+        inputs = inputs.unsqueeze(0)
+        # input = [seq_len = 1, batch size]
+        embedded = self.dropout(self.embedding(inputs))
+        embedded = torch.cat([embedded, H0], dim=2)
+        # embedded = [1, batch size, emb dim + lstm_hid_dim]
+        output, (hidden, cell) = self.rnn(embedded, (hidden, cell))
+        # output = [1, batch size, lstm_hid dim]
+        # hidden = [n layers = 1, batch size, lstm_hid dim]
+        # cell = [n layers, batch size, lstm hid dim]
+
+        prediction = self.fc_pred(output.squeeze(0))
+        # prediction = [batch size, vocab size]
+
+        return prediction, hidden, cell
+
+    def forward(self, src, trg, teacher_forcing_ratio=1):
+        # src = [src len, batch size]
+        # trg = [trg len, batch size]
+        # teacher_forcing_ratio is probability to use teacher forcing
+        # e.g. if teacher_forcing_ratio is 0.75 we use ground-truth inputs 75% of the time
+        batch_size = trg.shape[1]
+        trg_len = trg.shape[0]
+
+        # tensor to store decoder outputs
+        outputs = torch.zeros(trg_len, batch_size, self.vocab_size).to(self.device)
+
+        H0 = self.forward_encoder(src, trg)
+        hidden = H0
+        # first input to the decoder is the <sos> tokens
+        inputs = trg[0, :]
+        cell = torch.zeros_like(H0)
+        for t in range(1, trg_len):
+            # insert input token embedding, previous hidden and previous cell states
+            # receive output tensor (predictions) and new hidden and cell states
+            output, hidden, cell = self.forward_decoder(inputs, hidden, cell, H0)
+
+            # place predictions in a tensor holding predictions for each token
+            outputs[t] = output
+
+            # decide if we are going to use teacher forcing or not
+            teacher_force = random.random() < teacher_forcing_ratio
+
+            # get the highest predicted token from our predictions
+            top1 = output.argmax(1)
+
+            # if teacher forcing, use actual next token as next input
+            # if not, use predicted token
+            inputs = trg[t] if teacher_force else top1
+
+        return outputs
+
+
 class Encoder(nn.Module):
     def __init__(self, input_dim, emb_dim, hid_dim, n_layers, dropout):
         super().__init__()
