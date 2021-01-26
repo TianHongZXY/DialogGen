@@ -362,7 +362,7 @@ def main():
     criterion = LabelSmoothing(size=len(TGT.vocab), padding_idx=padding_idx, smoothing=args.smoothing)
     criterion.to(device)
     model_opt = NoamOpt(args.d_model, args.factor, args.warmup,
-                        torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e9))
+                        torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
     for epoch in range(args.n_epochs):
         model.train()
         train_metrics = run_epoch(train_iter, model, SimpleLossCompute(model.generator, criterion, opt=model_opt),
