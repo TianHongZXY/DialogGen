@@ -22,7 +22,7 @@ def make_std_mask(tgt, pad):
     tgt_mask = (tgt != pad).unsqueeze(-2)
     #  subsequent_mask shape = [1, T, T]
     #  tgt_mask shape = [nbatches, T, T]
-    tgt_mask = tgt_mask & subsequent_mask(tgt.size(-1)).type_as(tgt_mask.data)
+    tgt_mask = tgt_mask & Variable(subsequent_mask(tgt.size(-1)).type_as(tgt_mask.data))
     return tgt_mask
 
 
@@ -34,9 +34,8 @@ class Batch(object):
         #  src_mask shape = [nbatches, 1, T]
         self.src_mask = (src != src_padding_idx).unsqueeze(-2)
         if tgt is not None:
-            #  丢掉句子末尾标记<eos>，用于作训练的输入
             self.tgt = tgt[:, :-1]
-            #  丢掉句子开头标记<sos>，用于作训练的标签，即输入往右偏移一位
+            # self.tgt_y 是 self.tgt往右偏移一位
             self.tgt_y = tgt[:, 1:]
             # tgt_mask shape = [nbatches, T, T]
             self.tgt_mask = make_std_mask(self.tgt, tgt_padding_idx)
@@ -66,7 +65,7 @@ def run_epoch(data_iter, model, loss_compute, fields, train=True):
         total_ce_loss += ce_loss
         total_tokens += batch.ntokens
         tokens += batch.ntokens
-        if i % 50 == 1 and train:
+        if train and i % 100 == 1:
             elapsed = time.time() - start
             print("Epoch Step: %d\tLoss: %f\tTokens per Sec: %f\tlr: %f" %
                     (i, loss / batch.ntokens, tokens / elapsed, loss_compute.opt.rate()))
@@ -232,6 +231,35 @@ def rebatch(padding_idx, batch):
     src, tgt = batch.src.transpose(0, 1), batch.tgt.transpose(0, 1)
     return Batch(src, tgt, padding_idx)
 
+def load_iwslt():
+    # For data loading.
+    import spacy
+    spacy_de = spacy.load('de')
+    spacy_en = spacy.load('en')
+
+    def tokenize_de(text):
+        return [tok.text for tok in spacy_de.tokenizer(text)]
+
+    def tokenize_en(text):
+        return [tok.text for tok in spacy_en.tokenizer(text)]
+
+    BOS_WORD = '<s>'
+    EOS_WORD = '</s>'
+    BLANK_WORD = "<blank>"
+    SRC = data.Field(tokenize=tokenize_de, pad_token=BLANK_WORD, batch_first=True)
+    TGT = data.Field(tokenize=tokenize_en, init_token=BOS_WORD,
+                     eos_token=EOS_WORD, pad_token=BLANK_WORD, batch_first=True)
+
+    MAX_LEN = 100
+    train, val, test = datasets.Multi30k.splits(
+        exts=('.de', '.en'), fields=[('src', SRC), ('tgt', TGT)],
+        filter_pred=lambda x: len(vars(x)['src']) <= MAX_LEN and
+                              len(vars(x)['tgt']) <= MAX_LEN)
+    MIN_FREQ = 2
+    SRC.build_vocab(train.src, min_freq=MIN_FREQ)
+    TGT.build_vocab(train.trg, min_freq=MIN_FREQ)
+    return {'train': train, 'val': val, 'test': test, 'src': SRC, 'tgt': TGT}
+
 
 def load_dataset(args, path):
     import spacy
@@ -274,12 +302,15 @@ def main():
     parser.add_argument('--save_dir', default='models', type=str, help='save dir')
     parser.add_argument('--num_workers', default=0, type=int, help='how many subprocesses to use for data loading. 0 means that the data will be loaded in the main process.')
     parser.add_argument('--vocab_file', default=None, type=str, help='vocab file path')
+    parser.add_argument('--lr', default=1e-3, type=float, help='learning rate')
     parser.add_argument('--l2', default=0, type=float, help='l2 regularization')
     parser.add_argument('--warmup', default=4000, type=int, help='warmup step for learning rate')
     parser.add_argument('--min_freq', default=2, type=int, help='min freq for word not to be converted into <unk>')
     parser.add_argument('--n_layers', default=6, type=int, help='layers of transformer')
     parser.add_argument('--head', default=8, type=int, help='num of heads of multi-head attention')
     parser.add_argument('--d_ff', default=2048, type=int, help='dim of FFN')
+    parser.add_argument('--smoothing', default=0.1, type=float, help='smoothing rate of computing kl div loss')
+    parser.add_argument('--factor', default=1, type=float, help='factor of learning rate')
     args, unparsed = parser.parse_known_args()
     device = torch.device(args.gpu if (torch.cuda.is_available() and args.gpu >= 0) else 'cpu')
     if args.save:
@@ -290,43 +321,60 @@ def main():
             os.mkdir(save_dir)
         with open(os.path.join(save_dir, 'args.txt'), 'w') as f:
             json.dump(args.__dict__, f, indent=2)
+    """
+    ########################################################
+    # train the model
     train_dict = load_dataset(args, args.train_file)
     valid_dict = load_dataset(args, args.valid_file)
     # test_dict = load_dataset(args, args.test_file)
-    # train_iter = MyIterator(train_dict['dataset'], batch_size=args.bs, train=True,
+    train_iter = MyIterator(train_dict['dataset'], batch_size=args.bs, train=True,
+            sort_key=lambda x: (len(x.src), len(x.tgt)), device=device, repeat=False, sort=True)
+    # train_iter = data.BucketIterator(train_dict['dataset'], batch_size=args.bs, train=True,
     #         sort_key=lambda x: (len(x.src), len(x.tgt)), device=device, repeat=False, sort=True)
-    train_iter = data.BucketIterator(train_dict['dataset'], batch_size=args.bs, train=True,
+    valid_iter = MyIterator(valid_dict['dataset'], batch_size=args.bs, train=False,
             sort_key=lambda x: (len(x.src), len(x.tgt)), device=device, repeat=False, sort=True)
-    valid_iter = data.BucketIterator(valid_dict['dataset'], batch_size=args.bs, train=False,
-            sort_key=lambda x: (len(x.src), len(x.tgt)), device=device, repeat=False, sort=True)
+    # valid_iter = data.BucketIterator(valid_dict['dataset'], batch_size=args.bs, train=False,
+    #         sort_key=lambda x: (len(x.src), len(x.tgt)), device=device, repeat=False, sort=True)
+
     # test_iter = MyIterator(test_dict['dataset'], batch_size=args.bs, train=False,
     #         sort_key=lambda x: (len(x.src), len(x.tgt)), device=device, repeat=False, sort=True)
     SRC = train_dict['src']
     TGT = train_dict['tgt']
+    """
+    ########################################################
+    # test model on iwslt
+    dataset_dict = load_iwslt()
+    train_iter = data.BucketIterator(dataset_dict['train'], batch_size=args.bs, train=True,
+            sort_key=lambda x: (len(x.src), len(x.tgt)), device=device, repeat=False, sort=True)
+    valid_iter = data.BucketIterator(dataset_dict['val'], batch_size=args.bs, train=False,
+            sort_key=lambda x: (len(x.src), len(x.tgt)), device=device, repeat=False, sort=True)
+    test_iter = data.BucketIterator(dataset_dict['test'], batch_size=args.bs, train=False,
+            sort_key=lambda x: (len(x.src), len(x.tgt)), device=device, repeat=False, sort=True)
+    SRC = dataset_dict['src']
+    TGT = dataset_dict['tgt']
+
     padding_idx = TGT.vocab.stoi[TGT.pad_token]
 
     model = make_model(len(SRC.vocab), len(TGT.vocab), N=args.n_layers,
             d_model=args.d_model, d_ff=args.d_ff, h=args.head, dropout=args.dropout)
     print(f'The model has {count_parameters(model)} trainable parameters')
     model.to(device)
-    criterion = LabelSmoothing(size=len(TGT.vocab), padding_idx=padding_idx, smoothing=0.1)
+    criterion = LabelSmoothing(size=len(TGT.vocab), padding_idx=padding_idx, smoothing=args.smoothing)
     criterion.to(device)
-    model_opt = NoamOpt(args.d_model, 1, args.warmup, torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e9))
+    model_opt = NoamOpt(args.d_model, args.factor, args.warmup,
+                        torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e9))
     for epoch in range(args.n_epochs):
         model.train()
         train_metrics = run_epoch(train_iter, model, SimpleLossCompute(model.generator, criterion, opt=model_opt),
                                   fields={'src': SRC, 'tgt': TGT})
         print_metrics(train_metrics, mode='Train')
-        #  print(f"train loss = {result_dict['kl_div_loss']}\t train ppl = {math.exp(result_dict['ce_loss'])}")
         model.eval()
         valid_metrics = run_epoch(valid_iter, model, SimpleLossCompute(model.generator, criterion, opt=None),
-                                  fields={'src': SRC, 'tgt': TGT})
+                                  fields={'src': SRC, 'tgt': TGT}, train=False)
         print_metrics(valid_metrics, mode='Valid')
-        #  print(f"valid loss = {result_dict['kl_div_loss']}\t valid ppl = {math.exp(result_dict['ce_loss'])}")
         # test_metrics = run_epoch(test_iter, model, SimpleLossCompute(model.generator, criterion, opt=None),
-        #                          fields={'src': SRC, 'tgt': TGT})
+        #                          fields={'src': SRC, 'tgt': TGT}, train=False)
         # print_metrics(test_metrics, mode='Test')
-        #  print(f"test loss = {result_dict['kl_div_loss']}\t test ppl = {math.exp(result_dict['ce_loss'])}")
         if args.save:
             torch.save(model.state_dict(), os.path.join(save_dir, f'transformer-{epoch}.pt'))
             with open(os.path.join(save_dir, f'log_epoch{epoch}.txt'), 'w') as log_file:

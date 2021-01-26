@@ -40,7 +40,7 @@ def attention(query, key, value, mask=None, dropout=None):
     scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
     if mask is not None:
         # src / tgt mask shape = [nbatches, 1, 1, T_k] / [nbatches, 1, T_q, T_q]
-        scores.masked_fill(mask == 0, -1e9)
+        scores = scores.masked_fill(mask == 0, -1e9)
     p_attn = F.softmax(scores, dim=-1)
     if dropout is not None:
         p_attn = dropout(p_attn)
@@ -108,8 +108,8 @@ class PositionalEncoding(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
 
         pe = torch.zeros(max_len, d_model, requires_grad=False)
-        position = torch.arange(0.0, max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0.0, d_model, 2) * 
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) *
                             -(math.log(1e4) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
@@ -170,7 +170,7 @@ class DecoderLayer(nn.Module):
     "Decoder is made of self-attn, src-attn, and feed forward"
     def __init__(self, size, self_attn, src_attn, feed_forward, dropout):
         super(DecoderLayer, self).__init__()
-        self.size =size
+        self.size = size
         self.self_attn = self_attn
         self.src_attn = src_attn
         self.feed_forward = feed_forward
