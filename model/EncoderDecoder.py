@@ -1,12 +1,13 @@
 import torch.nn as nn
+from utils import init_weights
 
 
-class EncoderDecoder(nn.Module):
+class Transformer(nn.Module):
     """
     A standard Encoder-Decoder architecture. Base for this and many other models.
     """
     def __init__(self, encoder, decoder, src_embed, tgt_embed, generator):
-        super(EncoderDecoder, self).__init__()
+        super(Transformer, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
         self.src_embed = src_embed
@@ -21,3 +22,23 @@ class EncoderDecoder(nn.Module):
 
     def decode(self, memory, src_mask, tgt, tgt_mask):
         return self.decoder(self.tgt_embed(tgt), memory, src_mask, tgt_mask)
+
+
+class RNNBaseSeq2Seq(nn.Module):
+    def __init__(self, encoder, decoder, src_embed, tgt_embed, generator):
+        super(RNNBaseSeq2Seq, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.src_embed = src_embed
+        self.tgt_embed = tgt_embed
+        self.generator = generator
+        self.apply(init_weights)
+
+    def forward(self, src, tgt, src_len):
+        return self.decode(tgt, self.encode(src, src_len))
+
+    def encode(self, src, src_len):
+        return self.encoder(self.src_embed(src), src_len)
+
+    def decode(self, tgt, state):
+        return self.decoder(self.tgt_embed(tgt), state)
