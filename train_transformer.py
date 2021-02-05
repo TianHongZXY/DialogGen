@@ -1,4 +1,4 @@
-from my_transformer import subsequent_mask, make_model
+from my_transformer import make_model
 import math
 import os
 import time
@@ -7,13 +7,22 @@ import torch.nn as nn
 from torch.autograd.variable import Variable
 import numpy as np
 from torchtext import data, datasets
-from utils import count_parameters, write_metrics, print_metrics
+from utils import count_parameters, write_metrics, print_metrics, subsequent_mask
 import json
 from datetime import datetime
 from dateutil import tz, zoneinfo
 import argparse
 from tqdm import tqdm
-from memory_profiler import profile
+from prepare_data import load_seq2seq_dataset as load_dataset
+from prepare_data import load_iwslt
+from allennlp.training.metrics import BLEU
+from metrics import distinct
+from torch.utils.tensorboard import SummaryWriter
+from optim.Optim import NoamOptimWrapper as NoamOpt
+import logging
+import coloredlogs
+logger = logging.getLogger(__name__)
+coloredlogs.install(level='INFO', logger=logger)
 
 
 def make_std_mask(tgt, pad):
@@ -42,7 +51,7 @@ class Batch(object):
             self.ntokens = (self.tgt_y != tgt_padding_idx).data.sum()
 
 
-def run_epoch(data_iter, model, loss_compute, fields, train=True):
+def run_epoch(data_iter, model, loss_compute, fields, train=True, writer=None):
     "Training和记录log"
     start = time.time()
     total_tokens = 0
@@ -51,6 +60,11 @@ def run_epoch(data_iter, model, loss_compute, fields, train=True):
     tokens = 0
     src_padding_idx = fields['src'].vocab.stoi[fields['src'].pad_token]
     tgt_padding_idx = fields['tgt'].vocab.stoi[fields['tgt'].pad_token]
+    tgt_init_token_idx = fields['tgt'].vocab.stoi[fields['tgt'].init_token]
+    tgt_eos_token_idx = fields['tgt'].vocab.stoi[fields['tgt'].eos_token]
+    hyps = []
+    bleu = BLEU(exclude_indices={tgt_padding_idx, tgt_eos_token_idx, tgt_init_token_idx})
+    global_step = 0
     for i, batch in enumerate(data_iter):
         setattr(batch, 'tgt_y', batch.tgt[:, 1:])
         batch.tgt = batch.tgt[:, :-1]
@@ -60,19 +74,41 @@ def run_epoch(data_iter, model, loss_compute, fields, train=True):
         setattr(batch, 'ntokens', (batch.tgt_y != tgt_padding_idx).data.sum())
         out = model(batch.src, batch.tgt,
                     batch.src_mask, batch.tgt_mask)
-        loss, ce_loss = loss_compute(out, batch.tgt_y, batch.ntokens)
+        loss, ce_loss, softmax_logits = loss_compute(out, batch.tgt_y, batch.ntokens)
+        if not train:
+            pred = softmax_logits.argmax(-1)
+            bleu(predictions=pred, gold_targets=batch.tgt_y)
+            hyps.extend([h for h in pred.numpy()])
         total_loss += loss
         total_ce_loss += ce_loss
         total_tokens += batch.ntokens
         tokens += batch.ntokens
-        if train and i % 100 == 1:
+        global_step = loss_compute.opt._step if loss_compute.opt else 0
+        if i % 100 == 0:
             elapsed = time.time() - start
-            print("Epoch Step: %d\tLoss: %f\tTokens per Sec: %f\tlr: %f" %
-                    (i, loss / batch.ntokens, tokens / elapsed, loss_compute.opt.rate()))
-            start = time.time()
+            if train:
+                print("Global Step: %d\tEpoch Step: %d\tLoss: %f\tTokens per Sec: %f\tlr: %f" %
+                        (global_step, i + 1, loss / batch.ntokens, tokens / elapsed, loss_compute.opt.rate()))
+                if writer:
+                    writer.add_scalar('train_kl_div_loss', loss / batch.ntokens, global_step)
+                    writer.add_scalar('train_ce_loss', ce_loss / batch.ntokens, global_step)
+                    writer.add_scalar('train_ppl', math.exp(ce_loss / batch.ntokens), global_step)
             tokens = 0
-    return {'kl_div_loss': total_loss / total_tokens, 'ce_loss': total_ce_loss / total_tokens,
-            'ppl': math.exp(total_ce_loss / total_tokens)}
+            start = time.time()
+
+    metrics = {'kl_div_loss': total_loss / total_tokens, 'ce_loss': total_ce_loss / total_tokens,
+               'ppl': math.exp(total_ce_loss / total_tokens)}
+    if not train:
+        exclude_tokens = {tgt_padding_idx, tgt_eos_token_idx, tgt_init_token_idx}
+        inter_dist1, inter_dist2 = distinct(hyps, exclude_tokens=exclude_tokens)
+        metrics['bleu'] =  bleu.get_metric(reset=True)['BLEU']
+        metrics['dist-1'] = inter_dist1
+        metrics['dist-2'] = inter_dist2
+        if writer:
+            writer.add_scalar('bleu', metrics['bleu'], global_step)
+            writer.add_scalar('dist-1', metrics['dist-1'], global_step)
+            writer.add_scalar('dist-2', metrics['dist-2'], global_step)
+    return metrics
 
 
 global max_src_in_batch, max_tgt_in_batch
@@ -89,38 +125,8 @@ def batch_size_fn(new, count, sofar):
     return max(src_elements, tgt_elements)
 
 
-class NoamOpt:
-    "Optim wrapper that implements rate."
-    def __init__(self, model_size, factor, warmup, optimizer):
-        self.optimizer = optimizer
-        self._step = 0
-        self.warmup = warmup
-        self.factor = factor
-        self.model_size = model_size
-        self._rate = 0
-
-    def step(self):
-        "Update parameters and rate"
-        self._step += 1
-        rate = self.rate()
-        for p in self.optimizer.param_groups:
-            p['lr'] = rate
-        self._rate = rate
-        self.optimizer.step()
-
-    def rate(self, step=None):
-        """
-        Implement `lrate` = d_model^(-0.5) * min(step_num^(-0.5), step_num * warmup_steps^(-1.5))
-        lr 最大是d_model^(-0.5) * warmup_steps^(-0.5) = (d_model * warmup_steps)^(-0.5)
-        """
-        if step is None:
-            step = self._step
-        return self.factor * (self.model_size ** (-0.5) *
-                min(step **(-0.5), step * self.warmup ** (-1.5)))
-
-
 def get_std_opt(model):
-    return NoamOpt(model.src_embed[0].d_model, factor=2, warmup=4000,
+    return NoamOpt(model.src_embed[0].embedding_size, factor=2, warmup=4000,
             optimizer=torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), epos=1e-9))
 
 
@@ -129,7 +135,8 @@ class LabelSmoothing(nn.Module):
     def __init__(self, size, padding_idx, smoothing=0.0):
         super(LabelSmoothing, self).__init__()
         self.criterion = nn.KLDivLoss(reduction='sum')
-        self.ce_criterion = nn.CrossEntropyLoss(reduction='sum', ignore_index=padding_idx)
+        self.ce_criterion = nn.NLLLoss(reduction='sum', ignore_index=padding_idx)
+        # self.ce_criterion = nn.CrossEntropyLoss(reduction='sum', ignore_index=padding_idx)
         self.padding_idx = padding_idx
         self.confidence = 1.0 - smoothing
         self.smoothing = smoothing
@@ -172,11 +179,9 @@ class SimpleLossCompute:
         if self.opt is not None:
             self.opt.step()
             self.opt.optimizer.zero_grad()
-        return loss.item() * norm, ce_loss.item()
+        return loss.item() * norm, ce_loss.item(), x.detach().cpu()
 
-#  from pysnooper import snoop
-#  from torchsnooper import snoop
-#  @snoop()
+
 def greedy_decode(model, src, src_mask, max_len, start_symbol):
     memory = model.encode(src, src_mask)
     #  ys shape [nbatches, T_q] = [1, 1]
@@ -214,10 +219,10 @@ class MyIterator(data.Iterator):
                     #  对预先加载出来的100个batch按照sort_key排序，然后按正常batch_size一个一个生成minibatch
                     p_batch = data.batch(p, self.batch_size)
                     #  对样本长度都相近的minibatch做一次shuffle
-                    for b in p_batch:
-                        yield b
-                    # for b in random_shuffler(list(p_batch)):
+                    # for b in p_batch:
                     #     yield b
+                    for b in random_shuffler(list(p_batch)):
+                        yield b
             self.batches = pool(self.data(), self.random_shuffler)
         else:
             self.batches = []
@@ -231,56 +236,6 @@ def rebatch(padding_idx, batch):
     src, tgt = batch.src.transpose(0, 1), batch.tgt.transpose(0, 1)
     return Batch(src, tgt, padding_idx)
 
-def load_iwslt():
-    # For data loading.
-    import spacy
-    spacy_de = spacy.load('de')
-    spacy_en = spacy.load('en')
-
-    def tokenize_de(text):
-        return [tok.text for tok in spacy_de.tokenizer(text)]
-
-    def tokenize_en(text):
-        return [tok.text for tok in spacy_en.tokenizer(text)]
-
-    BOS_WORD = '<s>'
-    EOS_WORD = '</s>'
-    BLANK_WORD = "<blank>"
-    SRC = data.Field(tokenize=tokenize_de, pad_token=BLANK_WORD, batch_first=True)
-    TGT = data.Field(tokenize=tokenize_en, init_token=BOS_WORD,
-                     eos_token=EOS_WORD, pad_token=BLANK_WORD, batch_first=True)
-
-    MAX_LEN = 100
-    train, val, test = datasets.Multi30k.splits(
-        exts=('.de', '.en'), fields=[('src', SRC), ('tgt', TGT)],
-        filter_pred=lambda x: len(vars(x)['src']) <= MAX_LEN and
-                              len(vars(x)['tgt']) <= MAX_LEN)
-    MIN_FREQ = 2
-    SRC.build_vocab(train.src, min_freq=MIN_FREQ)
-    TGT.build_vocab(train.trg, min_freq=MIN_FREQ)
-    return {'train': train, 'val': val, 'test': test, 'src': SRC, 'tgt': TGT}
-
-
-def load_dataset(args, path):
-    import spacy
-    spacy_en = spacy.load('en')
-    def tokenize_en(text):
-        return [tok.text for tok in spacy_en.tokenizer(text)]
-    pad_token = '<pad>'
-    sos_token = '<sos>'
-    eos_token = '<eos>'
-    SRC = data.Field(tokenize=tokenize_en, pad_token=pad_token, batch_first=True)
-    TGT = data.Field(tokenize=tokenize_en, init_token=sos_token,
-            eos_token=eos_token, pad_token=pad_token, batch_first=True)
-    MAX_LEN = args.maxlen
-    fields = [('src', SRC), ('tgt', TGT)]
-    dataset = data.TabularDataset(path, 'TSV', fields=fields,
-            filter_pred=lambda x: len(vars(x)['src']) <= MAX_LEN and len(vars(x)['tgt']) <= MAX_LEN)
-    MIN_FREQ = args.min_freq
-    SRC.build_vocab(dataset.src, min_freq=MIN_FREQ)
-    TGT.build_vocab(dataset.tgt, min_freq=MIN_FREQ)
-    return {'dataset': dataset, 'src': SRC, 'tgt': TGT}
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -288,7 +243,7 @@ def main():
     )
 
     parser.add_argument('--gpu', default=-1, type=int, help='which GPU to use, -1 means using CPU')
-    parser.add_argument('--save', default=False, type=bool, help='whether to save model or not')
+    parser.add_argument('--save', default=0, type=int, help='whether to save model or not')
     parser.add_argument('--bs', default=32, type=int, help='batch size')
     parser.add_argument('--d_model', default=512, type=int, help='hidden dim of lstm')
     parser.add_argument('--dropout', default=0.1, type=float, help='dropout ratio')
@@ -302,7 +257,7 @@ def main():
     parser.add_argument('--save_dir', default='models', type=str, help='save dir')
     parser.add_argument('--num_workers', default=0, type=int, help='how many subprocesses to use for data loading. 0 means that the data will be loaded in the main process.')
     parser.add_argument('--vocab_file', default=None, type=str, help='vocab file path')
-    parser.add_argument('--lr', default=1e-3, type=float, help='learning rate')
+    parser.add_argument('--lr', default=0, type=float, help='learning rate')
     parser.add_argument('--l2', default=0, type=float, help='l2 regularization')
     parser.add_argument('--warmup', default=4000, type=int, help='warmup step for learning rate')
     parser.add_argument('--min_freq', default=2, type=int, help='min freq for word not to be converted into <unk>')
@@ -311,33 +266,44 @@ def main():
     parser.add_argument('--d_ff', default=2048, type=int, help='dim of FFN')
     parser.add_argument('--smoothing', default=0.1, type=float, help='smoothing rate of computing kl div loss')
     parser.add_argument('--factor', default=1, type=float, help='factor of learning rate')
+    parser.add_argument('--model_path', default=None, type=str, help='restore model to continue training')
+    parser.add_argument('--global_step', default=None, type=int, help='global step for continuing training')
+    parser.add_argument('--share_decoder_embeddings', default=0, type=int, help="whether share decoder's embedding with generator's pre-softmax matrix")
     args, unparsed = parser.parse_known_args()
     device = torch.device(args.gpu if (torch.cuda.is_available() and args.gpu >= 0) else 'cpu')
-    if args.save:
+    writer = None
+    if args.save and args.model_path is None:
         tz_sh = tz.gettz('Asia/Shanghai')
         save_dir = os.path.join(args.save_dir, 'run' + str(datetime.now(tz=tz_sh)).replace(":", "-").split(".")[0].replace(" ", '.'))
         args.save_dir = save_dir
+        logger.info(f"Saving log files and model to {save_dir}")
         if not os.path.exists(save_dir):
             os.mkdir(save_dir)
         with open(os.path.join(save_dir, 'args.txt'), 'w') as f:
             json.dump(args.__dict__, f, indent=2)
-    """
+    elif args.save and args.model_path:
+        save_dir = os.path.split(args.model_path)[0]
+
+    if args.save:
+        writer = SummaryWriter(os.path.join(save_dir, 'summary'))
     ########################################################
     # train the model
-    train_dict = load_dataset(args, args.train_file)
-    valid_dict = load_dataset(args, args.valid_file)
-    # test_dict = load_dataset(args, args.test_file)
-    train_iter = MyIterator(train_dict['dataset'], batch_size=args.bs, train=True,
+    logger.info("Loading train dataset...")
+    train_dict = load_dataset(args, file_path='.', train_file=args.train_file, valid_file=args.valid_file, test_file=args.test_file, train=True)
+    # logger.info("Loading valid dataset...")
+    # valid_dict = load_dataset(args, file_path='.', train_file=args.train_file, valid_file=args.valid_file, test_file=args.test_file, train=False)
+    # test_dict = load_dataset(args, args.test_file, train=False)
+    train_iter = MyIterator(train_dict['dataset'][0], batch_size=args.bs, train=True,
             sort_key=lambda x: (len(x.src), len(x.tgt)), device=device, repeat=False, sort=True)
     # train_iter = data.BucketIterator(train_dict['dataset'], batch_size=args.bs, train=True,
     #         sort_key=lambda x: (len(x.src), len(x.tgt)), device=device, repeat=False, sort=True)
-    valid_iter = MyIterator(valid_dict['dataset'], batch_size=args.bs, train=False,
+    valid_iter = MyIterator(train_dict['dataset'][1], batch_size=args.bs, train=False,
             sort_key=lambda x: (len(x.src), len(x.tgt)), device=device, repeat=False, sort=True)
     # valid_iter = data.BucketIterator(valid_dict['dataset'], batch_size=args.bs, train=False,
     #         sort_key=lambda x: (len(x.src), len(x.tgt)), device=device, repeat=False, sort=True)
 
-    # test_iter = MyIterator(test_dict['dataset'], batch_size=args.bs, train=False,
-    #         sort_key=lambda x: (len(x.src), len(x.tgt)), device=device, repeat=False, sort=True)
+    test_iter = MyIterator(train_dict['dataset'][2], batch_size=args.bs, train=False,
+            sort_key=lambda x: (len(x.src), len(x.tgt)), device=device, repeat=False, sort=True)
     SRC = train_dict['src']
     TGT = train_dict['tgt']
     """
@@ -352,36 +318,74 @@ def main():
             sort_key=lambda x: (len(x.src), len(x.tgt)), device=device, repeat=False, sort=True)
     SRC = dataset_dict['src']
     TGT = dataset_dict['tgt']
-
+    """
     padding_idx = TGT.vocab.stoi[TGT.pad_token]
 
     model = make_model(len(SRC.vocab), len(TGT.vocab), N=args.n_layers,
             d_model=args.d_model, d_ff=args.d_ff, h=args.head, dropout=args.dropout)
+    if args.model_path is not None:
+        logger.info(f"Restore model from {args.model_path}...")
+        model.load_state_dict(torch.load(args.model_path, map_location={'cuda:0': 'cuda:' + str(args.gpu)}))
+    if args.share_decoder_embeddings:
+        logger.info("The model shares tgt embedding with generator proj.")
+        model.generator.proj.weight = model.tgt_embed[0].lut.weight
+
     print(f'The model has {count_parameters(model)} trainable parameters')
     model.to(device)
     criterion = LabelSmoothing(size=len(TGT.vocab), padding_idx=padding_idx, smoothing=args.smoothing)
     criterion.to(device)
     model_opt = NoamOpt(args.d_model, args.factor, args.warmup,
                         torch.optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9))
+
+    if args.global_step is not None:
+        logger.info(f'Global step start from {args.global_step}')
+        model_opt._step = args.global_step
+
+    best_step = -1
+    best_valid_loss = float('inf')
+    best_ppl = float('inf')
     for epoch in range(args.n_epochs):
         model.train()
         train_metrics = run_epoch(train_iter, model, SimpleLossCompute(model.generator, criterion, opt=model_opt),
-                                  fields={'src': SRC, 'tgt': TGT})
+                                  fields={'src': SRC, 'tgt': TGT}, writer=writer)
         print_metrics(train_metrics, mode='Train')
+        global_step = model_opt._step
         model.eval()
         valid_metrics = run_epoch(valid_iter, model, SimpleLossCompute(model.generator, criterion, opt=None),
                                   fields={'src': SRC, 'tgt': TGT}, train=False)
+        test_metrics = run_epoch(test_iter, model, SimpleLossCompute(model.generator, criterion, opt=None),
+                                  fields={'src': SRC, 'tgt': TGT}, train=False)
+
+        if valid_metrics['ce_loss'] < best_valid_loss:
+            best_valid_loss = valid_metrics['ce_loss']
+            best_ppl = valid_metrics['ppl']
+            best_step = global_step
+        valid_metrics['best_step'] = best_step
+        valid_metrics['best_valid_loss'] = best_valid_loss
+        valid_metrics['best_ppl'] = best_ppl
+        if writer:
+            writer.add_scalar('valid_kl_div_loss', valid_metrics['kl_div_loss'], global_step)
+            writer.add_scalar('valid_ce_loss', valid_metrics['ce_loss'], global_step)
+            writer.add_scalar('valid_ppl', valid_metrics['ppl'], global_step)
+            writer.add_scalar('valid_bleu', valid_metrics['bleu'], global_step)
+            writer.add_scalar('valid_dist-1', valid_metrics['dist-1'], global_step)
+            writer.add_scalar('valid_dist-2', valid_metrics['dist-2'], global_step)
+
+            writer.add_scalar('test_kl_div_loss', test_metrics['kl_div_loss'], global_step)
+            writer.add_scalar('test_ce_loss', test_metrics['ce_loss'], global_step)
+            writer.add_scalar('test_ppl', test_metrics['ppl'], global_step)
+            writer.add_scalar('test_bleu', test_metrics['bleu'], global_step)
+            writer.add_scalar('test_dist-1', test_metrics['dist-1'], global_step)
+            writer.add_scalar('test_dist-2', test_metrics['dist-2'], global_step)
         print_metrics(valid_metrics, mode='Valid')
-        # test_metrics = run_epoch(test_iter, model, SimpleLossCompute(model.generator, criterion, opt=None),
-        #                          fields={'src': SRC, 'tgt': TGT}, train=False)
-        # print_metrics(test_metrics, mode='Test')
+        print_metrics(test_metrics, mode='Test')
         if args.save:
-            torch.save(model.state_dict(), os.path.join(save_dir, f'transformer-{epoch}.pt'))
-            with open(os.path.join(save_dir, f'log_epoch{epoch}.txt'), 'w') as log_file:
-                log_file.write(f'Epoch: {epoch:02}\n')
+            torch.save(model.state_dict(), os.path.join(save_dir, f'model_global_step-{global_step}.pt'))
+            with open(os.path.join(save_dir, f'log_global_step-{global_step}.txt'), 'w') as log_file:
+                log_file.write(f'Global Step: {global_step}\n')
                 write_metrics(train_metrics, log_file, mode='Train')
                 write_metrics(valid_metrics, log_file, mode='Valid')
-                # write_metrics(test_metrics, log_file, mode='Test')
+                write_metrics(test_metrics, log_file, mode='Test')
 
 if __name__ == '__main__':
     main()
