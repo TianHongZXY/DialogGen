@@ -7,7 +7,7 @@ import torch.nn as nn
 from torch.autograd.variable import Variable
 import numpy as np
 from torchtext import data, datasets
-from utils import count_parameters, write_metrics, print_metrics, subsequent_mask
+from utils import count_parameters, write_metrics, print_metrics, subsequent_mask, write_metrics_to_writer
 import json
 from datetime import datetime
 from dateutil import tz, zoneinfo
@@ -104,25 +104,7 @@ def run_epoch(data_iter, model, loss_compute, fields, train=True, writer=None):
         metrics['bleu'] =  bleu.get_metric(reset=True)['BLEU']
         metrics['dist-1'] = inter_dist1
         metrics['dist-2'] = inter_dist2
-        if writer:
-            writer.add_scalar('bleu', metrics['bleu'], global_step)
-            writer.add_scalar('dist-1', metrics['dist-1'], global_step)
-            writer.add_scalar('dist-2', metrics['dist-2'], global_step)
     return metrics
-
-
-global max_src_in_batch, max_tgt_in_batch
-def batch_size_fn(new, count, sofar):
-    "Keep augmenting batch and calculate total number of tokens + padding."
-    global max_src_in_batch, max_tgt_in_batch
-    if count == 1:
-        max_src_in_batch = 0
-        max_tgt_in_batch = 0
-    max_src_in_batch = max(max_src_in_batch, len(new.src))
-    max_tgt_in_batch = max(max_tgt_in_batch, len(new.tgt) + 2)
-    src_elements = count * max_src_in_batch
-    tgt_elements = count * max_tgt_in_batch
-    return max(src_elements, tgt_elements)
 
 
 def get_std_opt(model):
@@ -360,27 +342,16 @@ def main():
             best_valid_loss = valid_metrics['ce_loss']
             best_ppl = valid_metrics['ppl']
             best_step = global_step
-        valid_metrics['best_step'] = best_step
-        valid_metrics['best_valid_loss'] = best_valid_loss
-        valid_metrics['best_ppl'] = best_ppl
-        if writer:
-            writer.add_scalar('valid_kl_div_loss', valid_metrics['kl_div_loss'], global_step)
-            writer.add_scalar('valid_ce_loss', valid_metrics['ce_loss'], global_step)
-            writer.add_scalar('valid_ppl', valid_metrics['ppl'], global_step)
-            writer.add_scalar('valid_bleu', valid_metrics['bleu'], global_step)
-            writer.add_scalar('valid_dist-1', valid_metrics['dist-1'], global_step)
-            writer.add_scalar('valid_dist-2', valid_metrics['dist-2'], global_step)
+            valid_metrics['best_step'] = best_step
+            valid_metrics['best_valid_loss'] = best_valid_loss
+            valid_metrics['best_ppl'] = best_ppl
 
-            writer.add_scalar('test_kl_div_loss', test_metrics['kl_div_loss'], global_step)
-            writer.add_scalar('test_ce_loss', test_metrics['ce_loss'], global_step)
-            writer.add_scalar('test_ppl', test_metrics['ppl'], global_step)
-            writer.add_scalar('test_bleu', test_metrics['bleu'], global_step)
-            writer.add_scalar('test_dist-1', test_metrics['dist-1'], global_step)
-            writer.add_scalar('test_dist-2', test_metrics['dist-2'], global_step)
         print_metrics(valid_metrics, mode='Valid')
         print_metrics(test_metrics, mode='Test')
         if args.save:
             torch.save(model.state_dict(), os.path.join(save_dir, f'model_global_step-{global_step}.pt'))
+            write_metrics_to_writer(valid_metrics, writer, global_step, mode='Valid')
+            write_metrics_to_writer(test_metrics, writer, global_step, mode='Test')
             with open(os.path.join(save_dir, f'log_global_step-{global_step}.txt'), 'w') as log_file:
                 log_file.write(f'Global Step: {global_step}\n')
                 write_metrics(train_metrics, log_file, mode='Train')

@@ -29,8 +29,8 @@ class SublayerConnection(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, sublayer):
-        # return x + self.dropout(sublayer(self.norm(x)))
-        return self.norm(x + self.dropout(sublayer(x)))  # 这么写应该是原论文的意思
+        return x + self.dropout(sublayer(self.norm(x)))  # transformers和opennmt里都是这么写的
+        # return self.norm(x + self.dropout(sublayer(x)))  # 这么写应该是原论文的意思
 
 
 def attention(query, key, value, mask=None, dropout=None):

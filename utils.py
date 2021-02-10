@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import torch.nn as nn
+import copy
 
 
 def corrcoef(x, rowvar=True):
@@ -73,7 +74,6 @@ def init_weights(module):
     if isinstance(module, nn.Linear):
         nn.init.xavier_uniform_(module.weight.data)
         if module.bias is not None:
-            # nn.init.orthogonal(module.weight)
             nn.init.constant_(module.bias.data, 0.0)
 
     elif isinstance(module, nn.LSTM):
@@ -91,17 +91,13 @@ def init_weights(module):
             nn.init.constant_(module.bias_hh_l0_reverse.data, 0.0)
             module.bias_hh_l0_reverse.data[hidden_size:(2*hidden_size)] = 1.0
 
-    elif isinstance(module, nn.Embedding):
-        nn.init.xavier_normal_(module.weight.data)
-
     elif isinstance(module, (nn.Conv2d, nn.Conv1d)):
-        nn.init.kaiming_normal_(module.weight.data)
+        nn.init.kaiming_uniform_(module.weight.data)
         nn.init.constant_(module.bias.data, 0.0)
 
     else:
-        pass
-        # for param in module.parameters():
-        #     nn.init.normal_(param)
+        for param in module.parameters():
+            nn.init.xavier_uniform_(param)
 
 
 def epoch_time(start_time, end_time):
@@ -116,7 +112,7 @@ def print_metrics(metrics, mode=''):
     print("#" * 20, mode + ' metrics ', "#" * 20)
     for k, v in metrics.items():
         print(f'\t{k}: {v:.5f}')
-    print("#" * 20, ' end ', "#" * 20)
+    print("#" * 20, ' end ', "#" * (24 + len(mode)))
 
 
 def write_metrics(metrics, file, mode=''):
@@ -124,3 +120,20 @@ def write_metrics(metrics, file, mode=''):
     for k, v in metrics.items():
         file.write(f'\t{k}: {v:.5f}\n')
     file.write("#" * 20 + ' end ' + "#" * 20 + '\n')
+
+
+def write_metrics_to_writer(metrics, writer, global_step, mode=''):
+    for k, v in metrics.items():
+        writer.add_scalar(f'{mode}_{k}', v, global_step)
+
+
+def clones(module, N):
+    """生成N个同样的layers"""
+    return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
+
+
+def subsequent_mask(size):
+    """将后续部分mask掉"""
+    attn_shape = (1, size, size)
+    subsequent_mask = np.triu(np.ones(attn_shape), k=1).astype('uint8')
+    return torch.from_numpy(subsequent_mask) == 0
