@@ -23,7 +23,7 @@ import json
 import argparse
 
 
-def distinct(seqs):
+def distinct(seqs, exclude_tokens=None):
     """
     Calculate intra/inter distinct 1/2.
     看论文的意思应该是用inter而不是intra
@@ -32,6 +32,8 @@ def distinct(seqs):
     # intra_dist1, intra_dist2 = [], []
     unigrams_all, bigrams_all = Counter(), Counter()
     for seq in seqs:
+        if isinstance(exclude_tokens, (set, list, tuple)):
+            seq = list(filter(lambda x: x not in exclude_tokens, seq))
         unigrams = Counter(seq)
         bigrams = Counter(zip(seq, seq[1:]))
         # intra_dist1.append((len(unigrams)+1e-12) / (len(seq)+1e-5))
@@ -110,15 +112,36 @@ def test_cvae(file):
     print(f'bleu_1: {bleu_1:.7f} | bleu_2: {bleu_2:.7f} | bleu_3: {bleu_3:.7f} | bleu_4: {bleu_4:.7f}')
 
 
+def test_cocon(pred_file, gold_file):
+    seqs = []
+    refs = []
+    with open(file=pred_file, mode='r', encoding='utf-8') as fr:
+        for line in fr.readlines():
+            seqs.append(line)
+    with open(file=gold_file, mode='r', encoding='utf-8') as fr:
+        for line in fr.readlines():
+            refs.append(line)
+    inter_dist1, inter_dist2 = distinct(seqs)
+    gold_inter_dist1, gold_inter_dist2 = distinct(refs)
+
+    # bleu_1, bleu_2, bleu_3, bleu_4 = bleu(seqs, refs)
+    print(f'inter_dist1: {inter_dist1:.7f} | inter_dist2: {inter_dist2:.7f} | gold_inter_dist1: {gold_inter_dist1:.7f} | '
+          f'gold_inter_dist2: {gold_inter_dist2:.7f}')
+    # print(f'bleu_1: {bleu_1:.7f} | bleu_2: {bleu_2:.7f} | bleu_3: {bleu_3:.7f} | bleu_4: {bleu_4:.7f}')
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='metrics'
     )
     parser.add_argument('--model', default='cvae', type=str, help="which model's results to test")
     parser.add_argument('--file', default='result/020000000047540.txt', type=str)
+    parser.add_argument('--pred_file', default=None, type=str)
+    parser.add_argument('--gold_file', default=None, type=str)
+
     args = parser.parse_args()
 
     if args.model == 'cvae':
         test_cvae(args.file)
-
-
+    elif args.model == 'cocon':
+        test_cocon(pred_file=args.pred_file, gold_file=args.gold_file)
