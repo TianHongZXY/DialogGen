@@ -97,7 +97,7 @@ def init_weights(module):
 
     else:
         for param in module.parameters():
-            nn.init.xavier_uniform_(param)
+            nn.init.uniform_(param, -0.02, 0.02)
 
 
 def epoch_time(start_time, end_time):

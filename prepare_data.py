@@ -1,4 +1,5 @@
 from torchtext.data import Field, BucketIterator, TabularDataset, Dataset
+from torchtext import data, datasets
 from torchtext.vocab import Vectors, GloVe, Vocab
 import torch
 import logging
@@ -34,12 +35,7 @@ def tokenizer(text):
     return text.split()
 
 
-def load_metalwoz(train_file_path, val_file_path=None, test_file_path=None,
-                    batch_size=32, device=torch.device('cpu'), maxlen=29):
-    pass
-
-
-def build_field_vocab(vocab_file, field, vectors=None):
+def build_field_vocab(vocab_file, field, min_freq=1, vectors=None):
     d = dict()
     with open(vocab_file, 'r') as f:
         for line in f.readlines():
@@ -52,10 +48,103 @@ def build_field_vocab(vocab_file, field, vectors=None):
                         field.eos_token]))
     field.vocab = field.vocab_cls(counter=freqs,
                                   max_size=35000,
-                                  min_freq=2,
+                                  min_freq=min_freq,
                                   specials=specials,
                                   vectors=vectors)
     return field
+
+
+def load_iwslt():
+    # For data loading.
+    import spacy
+    spacy_de = spacy.load('de')
+    spacy_en = spacy.load('en')
+
+    def tokenize_de(text):
+        return [tok.text for tok in spacy_de.tokenizer(text)]
+
+    def tokenize_en(text):
+        return [tok.text for tok in spacy_en.tokenizer(text)]
+
+    BOS_WORD = '<s>'
+    EOS_WORD = '</s>'
+    BLANK_WORD = "<blank>"
+    SRC = data.Field(tokenize=tokenize_de, pad_token=BLANK_WORD, batch_first=True)
+    TGT = data.Field(tokenize=tokenize_en, init_token=BOS_WORD,
+                     eos_token=EOS_WORD, pad_token=BLANK_WORD, batch_first=True)
+
+    MAX_LEN = 100
+    train, val, test = datasets.Multi30k.splits(
+        exts=('.de', '.en'), fields=[('src', SRC), ('tgt', TGT)],
+        filter_pred=lambda x: len(vars(x)['src']) <= MAX_LEN and
+                              len(vars(x)['tgt']) <= MAX_LEN)
+    MIN_FREQ = 2
+    SRC.build_vocab(train.src, min_freq=MIN_FREQ)
+    TGT.build_vocab(train.trg, min_freq=MIN_FREQ)
+    return {'train': train, 'val': val, 'test': test, 'src': SRC, 'tgt': TGT}
+
+
+import spacy
+spacy_en = spacy.load('en')
+def tokenize_en(text):
+    return [tok.text for tok in spacy_en.tokenizer(text)]
+
+
+def load_seq2seq_dataset(args, file_path, train_file, valid_file=None, test_file=None,
+                         train=True, tokenizer=None, pretrained_embed_file=None):
+    pad_token = '<pad>'
+    sos_token = '<sos>'
+    eos_token = '<eos>'
+    if tokenizer is None:
+        print("Tokenizer is not given! Using spacy en tokenizer as default.")
+        tokenizer = tokenize_en
+    SRC = data.Field(tokenize=tokenizer, pad_token=pad_token, batch_first=True)
+    TGT = data.Field(tokenize=tokenizer, init_token=sos_token,
+                     eos_token=eos_token, pad_token=pad_token, batch_first=True)
+    MAX_LEN = args.maxlen
+    fields = [('src', SRC), ('tgt', TGT)]
+    # dataset = data.TabularDataset(file_path, 'TSV', fields=fields,
+    #         filter_pred=lambda x: len(vars(x)['src']) <= MAX_LEN and len(vars(x)['tgt']) <= MAX_LEN)
+    dataset = data.TabularDataset.splits(path=file_path, format='TSV', train=train_file, validation=valid_file, test=test_file,
+                                         fields=fields, filter_pred=lambda x: len(vars(x)['src']) <= MAX_LEN and len(vars(x)['tgt']) <= MAX_LEN)
+    MIN_FREQ = args.min_freq
+    vectors = None
+    if pretrained_embed_file is not None:
+        if not os.path.exists('.vector_cache'):
+            os.mkdir('.vector_cache')
+            vectors = Vectors(name=pretrained_embed_file)
+    if args.vocab_file is None:
+        logger.info("No pre-defined vocab given, building new vocab now...")
+        # train disc的时候保存vocab文件，到了train gen时加载，保证两者的embedding共用一个vocab
+        SRC.build_vocab(dataset[0].src,
+                      max_size=35000,
+                      min_freq=MIN_FREQ,
+                      vectors=vectors
+                      )
+        TGT.build_vocab(dataset[0].tgt,
+                        max_size=35000,
+                        min_freq=MIN_FREQ,
+                        vectors=vectors)
+        logger.info(f"SRC has {len(SRC.vocab.itos)} words.")
+        logger.info(f"TGT has {len(TGT.vocab.itos)} words.")
+
+        if train and args.save:
+            # 保存时保存所有出现的单词，不管是否超过min_freq的要求
+            logger.info(f"Saving vocab file to {args.save_dir}")
+            with open(os.path.join(args.save_dir, 'src_vocab.txt'), 'w') as f:
+                for k, v in SRC.vocab.freqs.most_common():
+                    f.write("{}:{}\n".format(k, v))
+            with open(os.path.join(args.save_dir, 'tgt_vocab.txt'), 'w') as f:
+                for k, v in TGT.vocab.freqs.most_common():
+                    f.write("{}:{}\n".format(k, v))
+    else:
+        #  优先使用给定的vocab file
+        logger.info(f"Using vocab file from {args.save_dir}")
+        SRC = build_field_vocab(vocab_file=os.path.join(args.save_dir, 'src_vocab.txt'),
+                                field=SRC, min_freq=MIN_FREQ, vectors=vectors)
+        TGT = build_field_vocab(vocab_file=os.path.join(args.save_dir, 'tgt_vocab.txt'),
+                                field=TGT, min_freq=MIN_FREQ, vectors=vectors)
+    return {'dataset': dataset, 'src': SRC, 'tgt': TGT}
 
 
 def load_cocon_data(args, train_file_path, val_file_path=None, test_file_path=None,
@@ -110,13 +199,13 @@ def load_cocon_data(args, train_file_path, val_file_path=None, test_file_path=No
     elif args.vocab_file is not None:
         #  优先使用给定的vocab file
         logger.info(f"Using vocab file from {args.vocab_file}")
-        texts = build_field_vocab(vocab_file=args.vocab_file, field=texts, vectors=vectors)
+        texts = build_field_vocab(vocab_file=args.vocab_file, field=texts, min_freq=2, vectors=vectors)
     elif args.trained_disc is not None:
         # 当没有给定vocab file时，选用disc的vocab
         disc_save_dir = os.path.split(args.trained_disc)[0]
         vocab_file = os.path.join(disc_save_dir, 'vocab.txt')
         logger.info(f"Using vocab file from {vocab_file}")
-        texts = build_field_vocab(vocab_file=vocab_file, field=texts, vectors=vectors)
+        texts = build_field_vocab(vocab_file=vocab_file, field=texts, min_freq=2, vectors=vectors)
 
     train_iterator, valid_iterator, test_iterator = BucketIterator.splits(
         (train, valid, test),
@@ -130,37 +219,37 @@ def load_cocon_data(args, train_file_path, val_file_path=None, test_file_path=No
             "valid_iterator": valid_iterator, "test_iterator": test_iterator}
 
 
-def load_data(train_file_path='dailydialog_src_tgt_train.tsv', val_file_path=None, test_file_path=None,
-              batch_size=32, device=torch.device('cpu')):
-    SRC = Field(tokenize=tokenizer,
-                init_token='<sos>',
-                eos_token='<eos>',
-                lower=True,
-                include_lengths=True)
-    fields = [("src", SRC), ("trg", SRC)]
-    train, valid, test = TabularDataset.splits(path='.',
-                                               train='src_tgt_train.tsv',
-                                               validation='src_tgt_val.tsv',
-                                               test='src_tgt_test.tsv',
-                                               format='tsv',
-                                               fields=fields
-                                               )
-    BATCH_SIZE = batch_size
-    SRC.build_vocab(train)
-    train_iterator, valid_iterator, test_iterator = BucketIterator.splits(
-        (train, valid, test),
-        batch_size=BATCH_SIZE,
-        sort_key=lambda x: len(x.src),
-        shuffle=True,
-        sort_within_batch=True)
-
-    train_iterator = DataLoader(list(train_iterator), batch_size=args.batch_size, num_workers=args.num_workers)
-    valid_iterator = DataLoader(list(valid_iterator), batch_size=args.batch_size, num_workers=args.num_workers)
-    test_iterator = DataLoader(list(test_iterator), batch_size=args.batch_size, num_workers=args.num_workers)
-
-    return {"fields": (SRC, ), "vocab": SRC.vocab, "train_data": train, "val_data": valid,
-            "test_data": test, "train_iterator": train_iterator,
-            "valid_iterator": valid_iterator, "test_iterator": test_iterator}
+# def load_data(train_file_path='dailydialog_src_tgt_train.tsv', val_file_path=None, test_file_path=None,
+#               batch_size=32, device=torch.device('cpu')):
+#     SRC = Field(tokenize=tokenizer,
+#                 init_token='<sos>',
+#                 eos_token='<eos>',
+#                 lower=True,
+#                 include_lengths=True)
+#     fields = [("src", SRC), ("trg", SRC)]
+#     train, valid, test = TabularDataset.splits(path='.',
+#                                                train='src_tgt_train.tsv',
+#                                                validation='src_tgt_val.tsv',
+#                                                test='src_tgt_test.tsv',
+#                                                format='tsv',
+#                                                fields=fields
+#                                                )
+#     BATCH_SIZE = batch_size
+#     SRC.build_vocab(train)
+#     train_iterator, valid_iterator, test_iterator = BucketIterator.splits(
+#         (train, valid, test),
+#         batch_size=BATCH_SIZE,
+#         sort_key=lambda x: len(x.src),
+#         shuffle=True,
+#         sort_within_batch=True)
+#
+#     train_iterator = DataLoader(list(train_iterator), batch_size=args.batch_size, num_workers=args.num_workers)
+#     valid_iterator = DataLoader(list(valid_iterator), batch_size=args.batch_size, num_workers=args.num_workers)
+#     test_iterator = DataLoader(list(test_iterator), batch_size=args.batch_size, num_workers=args.num_workers)
+#
+#     return {"fields": (SRC, ), "vocab": SRC.vocab, "train_data": train, "val_data": valid,
+#             "test_data": test, "train_iterator": train_iterator,
+#             "valid_iterator": valid_iterator, "test_iterator": test_iterator}
 
 
 # if __name__ == '__main__':
