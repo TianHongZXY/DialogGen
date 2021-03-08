@@ -23,6 +23,28 @@ import json
 import argparse
 
 
+class Distinct:
+    def __init__(self, n=2, exclude_tokens=None):
+        self.n = n
+        self.exclude_tokens = exclude_tokens
+        if self.exclude_tokens:
+            self.exclude_tokens = set(self.exclude_tokens)
+        self.n_grams_all = [Counter() for i in range(n)]
+
+    def forward(self, seqs):
+        for seq in seqs:
+            if self.exclude_tokens:
+                seq = list(filter(lambda x: x not in self.exclude_tokens, seq))
+            for i in range(self.n):
+                k_grams = Counter(zip(*[seq[k:] for k in range(i + 1)]))
+                self.n_grams_all[i].update(k_grams)
+        dist_n = dict()
+        for i, dist in enumerate(self.n_grams_all):
+            dist_n[f'dist_{i + 1}'] = (len(dist) + 1e-12) / (sum(dist.values()) + 1e-5)
+
+        return dist_n
+
+
 def distinct(seqs, exclude_tokens=None):
     """
     Calculate intra/inter distinct 1/2.
